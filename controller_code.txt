@@ -1,0 +1,3862 @@
+=== ./tests/controller/test_scheduler.py ===
+from unittest.mock import AsyncMock, patch
+import asyncio
+import random
+import time
+import unittest
+
+from koreo.result import Retry, PermFail
+from controller import scheduler
+
+
+class TestWorker(unittest.IsolatedAsyncioTestCase):
+    async def test_clean_reconcile(self):
+        work = asyncio.Queue()
+        requests = asyncio.Queue()
+
+        payload = {
+            "api_group": "unit.test",
+            "version": "v1test1",
+            "plural_kind": "UnitTest",
+            "resource_name": "unit-test",
+        }
+        request = scheduler.Request(at=0, payload=payload)
+
+        await work.put(request)
+
+        frequency_seconds = random.randint(350, 2500)
+
+        values = ({}, frequency_seconds, None, None)
+
+        async def work_processor(
+            payload, ok_frequency_seconds, sys_error_retries, user_retries
+        ):
+            nonlocal values
+            values = (payload, ok_frequency_seconds, sys_error_retries, user_retries)
+            return values
+
+        configuration = scheduler.Configuration(
+            work_processor=work_processor, frequency_seconds=frequency_seconds
+        )
+
+        worker_task = asyncio.create_task(
+            scheduler._worker_task(
+                work=work, requests=requests, configuration=configuration
+            )
+        )
+
+        await asyncio.wait_for(work.join(), timeout=1)
+
+        self.assertDictEqual(payload, values[0])
+        self.assertEqual(frequency_seconds, values[1])
+        self.assertEqual(0, values[2])
+        self.assertEqual(0, values[3])
+
+        work.put_nowait(scheduler.Shutdown())
+        await asyncio.wait_for(work.join(), timeout=1)
+        self.assertTrue(worker_task.done())
+
+    async def test_user_retry_retries(self):
+        retry_delay = 30
+
+        work_processor_called = False
+
+        async def work_processor(
+            payload, ok_frequency_seconds, sys_error_retries, user_retries
+        ):
+            nonlocal work_processor_called
+            work_processor_called = True
+            return Retry(message="User Retry", delay=retry_delay)
+
+        configuration = scheduler.Configuration(work_processor=work_processor)
+
+        expect_time_after = time.monotonic() + retry_delay
+
+        work = asyncio.Queue()
+        requests = asyncio.Queue()
+
+        await work.put(
+            scheduler.Request(
+                at=0,
+                payload={},
+            )
+        )
+
+        work_task = asyncio.create_task(
+            scheduler._worker_task(
+                work=work, requests=requests, configuration=configuration
+            )
+        )
+
+        result = await asyncio.wait_for(requests.get(), timeout=1)
+
+        self.assertTrue(requests.empty())
+
+        self.assertTrue(work_processor_called)
+
+        self.assertGreaterEqual(result.at, expect_time_after)
+        self.assertLessEqual(result.at, time.monotonic() + retry_delay)
+
+        work.put_nowait(scheduler.Shutdown())
+        await asyncio.wait_for(work.join(), timeout=1)
+        self.assertTrue(work_task.done())
+
+    async def test_user_retry_retries_multiple_times(self):
+        retries = 20
+
+        retry_delay = 10
+
+        work_processor_called = False
+
+        async def work_processor(
+            payload, ok_frequency_seconds, sys_error_retries, user_retries
+        ):
+            nonlocal work_processor_called
+            work_processor_called = True
+            return Retry(message="User Retry", delay=retry_delay)
+
+        configuration = scheduler.Configuration(work_processor=work_processor)
+
+        work = asyncio.Queue()
+        requests = asyncio.Queue()
+
+        await work.put(scheduler.Request(at=0, payload={}))
+
+        work_task = asyncio.create_task(
+            scheduler._worker_task(
+                work=work, requests=requests, configuration=configuration
+            )
+        )
+
+        expect_time_after = None
+        for _ in range(20):
+            expect_time_after = time.monotonic() + retry_delay
+            result = await asyncio.wait_for(requests.get(), timeout=1)
+            await work.put(result)
+
+        result = await asyncio.wait_for(requests.get(), timeout=1)
+        self.assertTrue(requests.empty())
+
+        self.assertGreaterEqual(result.at, expect_time_after)
+        self.assertLessEqual(result.at, time.monotonic() + retry_delay)
+
+        self.assertEqual(result.user_retries, retries + 1)
+
+        self.assertTrue(work_processor_called)
+
+        work.put_nowait(scheduler.Shutdown())
+        await asyncio.wait_for(work.join(), timeout=1)
+        self.assertTrue(work_task.done())
+
+    async def test_user_perm_fail_does_not_retry(self):
+        work_processor_called = False
+
+        async def work_processor(
+            payload, ok_frequency_seconds, sys_error_retries, user_retries
+        ):
+            nonlocal work_processor_called
+            work_processor_called = True
+            return PermFail(message="User PermFail")
+
+        configuration = scheduler.Configuration(work_processor=work_processor)
+
+        work = asyncio.Queue()
+        requests = asyncio.Queue()
+
+        await work.put(scheduler.Request(at=0, payload={}))
+
+        work_task = asyncio.create_task(
+            scheduler._worker_task(
+                work=work, requests=requests, configuration=configuration
+            )
+        )
+
+        await asyncio.wait_for(work.join(), timeout=1)
+
+        self.assertTrue(requests.empty())
+
+        self.assertTrue(work_processor_called)
+
+        work.put_nowait(scheduler.Shutdown())
+        await asyncio.wait_for(work.join(), timeout=1)
+        self.assertTrue(work_task.done())
+
+    async def test_reconcile_exception_retries(self):
+        work_processor_called = False
+
+        async def work_processor(
+            payload, ok_frequency_seconds, sys_error_retries, user_retries
+        ):
+            nonlocal work_processor_called
+            work_processor_called = True
+            raise Exception("unit-test-reconcile-error")
+
+        retry_delay_base = random.randint(30, 90)
+        retry_delay_jitter = random.randint(10, 30)
+        configuration = scheduler.Configuration(
+            work_processor=work_processor,
+            retry_delay_base=retry_delay_base,
+            retry_delay_jitter=retry_delay_jitter,
+        )
+
+        expect_time_after = time.monotonic() + retry_delay_base
+
+        work = asyncio.Queue()
+        requests = asyncio.Queue()
+
+        await work.put(scheduler.Request(at=0, payload={}))
+
+        work_task = asyncio.create_task(
+            scheduler._worker_task(
+                work=work, requests=requests, configuration=configuration
+            )
+        )
+
+        result = await asyncio.wait_for(requests.get(), timeout=1)
+
+        self.assertTrue(requests.empty())
+        self.assertTrue(work_processor_called)
+
+        self.assertEqual(result.sys_error_retries, 1)
+        self.assertGreaterEqual(result.at, expect_time_after)
+        self.assertLessEqual(
+            result.at, time.monotonic() + retry_delay_base + retry_delay_jitter
+        )
+
+        work.put_nowait(scheduler.Shutdown())
+        await asyncio.wait_for(work.join(), timeout=1)
+        self.assertTrue(work_task.done())
+
+    async def test_reconcile_exception_retries_exponential_backoff(self):
+        work_processor_call_count = 0
+
+        async def work_processor(
+            payload, ok_frequency_seconds, sys_error_retries, user_retries
+        ):
+            nonlocal work_processor_call_count
+            work_processor_call_count += 1
+            raise Exception("unit-test-reconcile-error")
+
+        retry_max_retries = random.randint(5, 25)
+        retry_delay_base = random.randint(30, 90)
+        retry_delay_jitter = random.randint(10, 30)
+        retry_delay_max = random.randint(
+            round((2**retry_max_retries * retry_delay_base) * 2 / 3),
+            (2**retry_max_retries * retry_delay_base),
+        )
+        configuration = scheduler.Configuration(
+            work_processor=work_processor,
+            retry_max_retries=retry_max_retries,
+            retry_delay_base=retry_delay_base,
+            retry_delay_jitter=retry_delay_jitter,
+            retry_delay_max=retry_delay_max,
+        )
+
+        expect_time_after = time.monotonic() + retry_delay_base
+
+        work = asyncio.Queue()
+        requests = asyncio.Queue()
+
+        request = scheduler.Request(at=0, payload={})
+
+        # retry-at must be after the time it was inserted for processing
+        insert_time = time.monotonic()
+        await work.put(request)
+
+        work_task = asyncio.create_task(
+            scheduler._worker_task(
+                work=work, requests=requests, configuration=configuration
+            )
+        )
+
+        for retry_count in range(0, retry_max_retries - 1):
+            result = await asyncio.wait_for(requests.get(), timeout=1)
+
+            self.assertEqual(result.sys_error_retries, retry_count + 1)
+
+            backoff = min((2**retry_count) * retry_delay_base, retry_delay_max)
+            expect_time_after = insert_time + backoff
+
+            self.assertGreaterEqual(result.at, expect_time_after)
+            self.assertLessEqual(
+                result.at,
+                time.monotonic() + backoff + retry_delay_jitter,
+            )
+
+            insert_time = time.monotonic()
+            await work.put(result)
+
+        await asyncio.sleep(0)
+
+        # result = await asyncio.wait_for(reconciliation_requests.get(), timeout=1)
+        self.assertTrue(requests.empty())
+
+        self.assertEqual(retry_max_retries, work_processor_call_count)
+
+        work.put_nowait(scheduler.Shutdown())
+        await asyncio.wait_for(work.join(), timeout=1)
+        self.assertTrue(work_task.done())
+
+
+class TestOrchestrator(unittest.IsolatedAsyncioTestCase):
+    @patch("controller.scheduler._worker_task")
+    async def test_workers_are_spawned(self, worker_task_mock):
+        requests = AsyncMock(asyncio.PriorityQueue)
+        requests.get.side_effect = asyncio.CancelledError()
+
+        work_processor_called = False
+
+        async def work_processor(
+            payload, ok_frequency_seconds, sys_error_retries, user_retries
+        ):
+            nonlocal work_processor_called
+            work_processor_called = True
+            return True
+
+        test_worker_count = random.randint(2, 20)
+        configuration = scheduler.Configuration(
+            work_processor=work_processor, concurrency=test_worker_count
+        )
+
+        async with asyncio.timeout(0.1), asyncio.TaskGroup() as tg:
+            orchestrator_task = tg.create_task(
+                scheduler.orchestrator(tg, requests, configuration)
+            )
+
+            requests.put_nowait(scheduler.Shutdown())
+
+        self.assertFalse(work_processor_called)
+        self.assertEqual(test_worker_count, worker_task_mock.call_count)
+        self.assertTrue(requests.get.called)
+
+    async def test_ready_incoming_are_passed_through(self):
+        work_processor_call_count = 0
+
+        work_processor_called_values = {}
+
+        async def work_processor(
+            payload, ok_frequency_seconds, sys_error_retries, user_retries
+        ):
+            nonlocal work_processor_call_count, work_processor_called_values
+            work_processor_call_count += 1
+            work_processor_called_values = {
+                "payload": payload,
+                "ok_frequency_seconds": ok_frequency_seconds,
+                "sys_error_retries": sys_error_retries,
+                "user_retries": user_retries,
+            }
+            return True
+
+        configuration = scheduler.Configuration(
+            work_processor=work_processor, concurrency=1
+        )
+
+        requests = AsyncMock(asyncio.PriorityQueue)
+
+        payload = {
+            "api_group": "unit.test",
+            "version": "v1test1",
+            "plural_kind": "UnitTest",
+            "resource_name": "unit-test",
+        }
+        scheduled = scheduler.Request(at=time.monotonic(), payload=payload)
+
+        requests.get.side_effect = [scheduled, asyncio.CancelledError()]
+
+        try:
+            async with asyncio.timeout(0.1), asyncio.TaskGroup() as tg:
+                tg.create_task(scheduler.orchestrator(tg, requests, configuration))
+                await asyncio.sleep(0)
+                requests.put_nowait(scheduler.Shutdown())
+        except asyncio.TimeoutError:
+            pass
+
+        self.assertEqual(2, requests.get.call_count)
+        self.assertEqual(1, work_processor_call_count)
+        self.assertDictEqual(payload, work_processor_called_values.get("payload", {}))
+
+    @patch("asyncio.wait_for")
+    async def test_not_ready_incoming_are_held(self, asyncio_wait_for_patch):
+        work_processor_called = False
+
+        async def work_processor(
+            payload, ok_frequency_seconds, sys_error_retries, user_retries
+        ):
+            nonlocal work_processor_called
+            work_processor_called = True
+            return True
+
+        configuration = scheduler.Configuration(
+            work_processor=work_processor, concurrency=1
+        )
+
+        requests = AsyncMock(asyncio.PriorityQueue)
+        requests.get.return_value = None
+
+        delay_amount = random.randint(30, 3000)
+        insert_time = time.monotonic()
+
+        delayed_work = scheduler.Request(at=insert_time + delay_amount, payload={})
+
+        asyncio_wait_for_patch.side_effect = [
+            delayed_work,
+            asyncio.CancelledError(),
+            asyncio.CancelledError(),
+        ]
+
+        try:
+            async with asyncio.timeout(0), asyncio.TaskGroup() as tg:
+                tg.create_task(scheduler.orchestrator(tg, requests, configuration))
+                await asyncio.sleep(0)
+        except asyncio.TimeoutError:
+            pass
+
+        self.assertFalse(work_processor_called)
+
+        self.assertEqual(asyncio_wait_for_patch.call_count, 2)
+
+        last_call = asyncio_wait_for_patch.call_args.kwargs
+        timeout = last_call.get("timeout", 0)
+        self.assertAlmostEqual(delay_amount, round(timeout))
+
+        # Cleanup
+        for call in asyncio_wait_for_patch.call_args_list:
+            try:
+                get_call = asyncio.create_task(call[0][0])
+                get_call.cancel()
+                await get_call
+            except asyncio.CancelledError:
+                pass
+
+    @patch("asyncio.wait_for")
+    async def test_wait_timeout(self, asyncio_wait_for_patch):
+        work_processor_called = False
+
+        async def work_processor(
+            payload, ok_frequency_seconds, sys_error_retries, user_retries
+        ):
+            nonlocal work_processor_called
+            work_processor_called = True
+            return True
+
+        configuration = scheduler.Configuration(
+            work_processor=work_processor, concurrency=1
+        )
+
+        requests = AsyncMock(asyncio.PriorityQueue)
+        requests.get.return_value = None
+
+        asyncio_wait_for_patch.side_effect = [
+            asyncio.TimeoutError(),
+            asyncio.TimeoutError(),
+            asyncio.CancelledError(),
+        ]
+
+        try:
+            async with asyncio.timeout(0), asyncio.TaskGroup() as tg:
+                tg.create_task(scheduler.orchestrator(tg, requests, configuration))
+                await asyncio.sleep(0)
+        except asyncio.TimeoutError:
+            pass
+
+        self.assertFalse(work_processor_called)
+
+        self.assertEqual(asyncio_wait_for_patch.call_count, 3)
+
+        last_call = asyncio_wait_for_patch.call_args.kwargs
+        timeout = last_call.get("timeout", 0)
+        self.assertAlmostEqual(120, round(timeout))
+
+        # Cleanup
+        for call in asyncio_wait_for_patch.call_args_list:
+            try:
+                get_call = asyncio.create_task(call[0][0])
+                get_call.cancel()
+                await get_call
+            except asyncio.CancelledError:
+                pass
+
+=== ./tests/controller/test_kind_lookup.py ===
+from unittest.mock import AsyncMock
+import asyncio
+import unittest
+
+import kr8s.asyncio
+
+from controller.kind_lookup import get_full_kind, _reset, _lookup_locks
+
+
+class TestGetFullKind(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self):
+        _reset()
+
+    async def test_ok_lookup(self):
+        plural_kind = "unittesties"
+
+        api_mock = AsyncMock(kr8s.asyncio.Api)
+        api_mock.lookup_kind.return_value = (None, plural_kind, None)
+
+        api_version = "unit.test/v1"
+
+        result = await get_full_kind(api_mock, "UnitTest", api_version)
+
+        self.assertEqual(result, f"{plural_kind}.{api_version}")
+        self.assertEqual(1, api_mock.lookup_kind.call_count)
+
+    async def test_successive_lookups(self):
+        plural_kind = "unittesties"
+
+        api_mock = AsyncMock(kr8s.asyncio.Api)
+        api_mock.lookup_kind.return_value = (None, plural_kind, None)
+
+        api_version = "unit.test/v1"
+
+        result = await get_full_kind(api_mock, "UnitTest", api_version)
+        self.assertEqual(result, f"{plural_kind}.{api_version}")
+
+        result = await get_full_kind(api_mock, "UnitTest", api_version)
+        self.assertEqual(result, f"{plural_kind}.{api_version}")
+
+        self.assertEqual(1, api_mock.lookup_kind.call_count)
+
+    async def test_multiple_requests(self):
+        plural_kind = "unittesties"
+
+        async def lookup(_):
+            await asyncio.sleep(0)
+            return (None, plural_kind, None)
+
+        api_mock = AsyncMock(kr8s.asyncio.Api)
+        api_mock.lookup_kind.side_effect = lookup
+
+        api_version = "unit.test/v1"
+
+        tasks = [
+            asyncio.create_task(get_full_kind(api_mock, "UnitTest", api_version)),
+            asyncio.create_task(get_full_kind(api_mock, "UnitTest", api_version)),
+            asyncio.create_task(get_full_kind(api_mock, "UnitTest", api_version)),
+        ]
+        done, pending = await asyncio.wait(tasks)
+
+        self.assertEqual(len(tasks), len(done))
+        self.assertEqual(0, len(pending))
+
+        for task in tasks:
+            self.assertEqual(task.result(), f"{plural_kind}.{api_version}")
+
+        self.assertEqual(1, api_mock.lookup_kind.call_count)
+
+    async def test_missing_kind(self):
+        api_mock = AsyncMock(kr8s.asyncio.Api)
+        api_mock.lookup_kind.side_effect = ValueError("Kind not found")
+
+        api_version = "unit.test/v1"
+
+        full_kind = await get_full_kind(api_mock, "UnitTest", api_version)
+
+        self.assertIsNone(full_kind)
+
+    async def test_2_timeout_retries(self):
+        plural_kind = "unittesties"
+
+        api_mock = AsyncMock(kr8s.asyncio.Api)
+        api_mock.lookup_kind.side_effect = [
+            asyncio.TimeoutError(),
+            (None, plural_kind, None),
+        ]
+
+        api_version = "unit.test/v1"
+
+        result = await get_full_kind(api_mock, "UnitTest", api_version)
+        self.assertEqual(result, f"{plural_kind}.{api_version}")
+
+    async def test_too_many_timeout_retries(self):
+        api_mock = AsyncMock(kr8s.asyncio.Api)
+        api_mock.lookup_kind.side_effect = asyncio.TimeoutError()
+
+        api_version = "unit.test/v1"
+
+        with self.assertRaises(Exception):
+            await get_full_kind(api_mock, "unittest", api_version)
+
+    async def test_lock_timeout(self):
+        api_mock = AsyncMock(kr8s.asyncio.Api)
+        api_mock.lookup_kind.side_effect = asyncio.TimeoutError()
+
+        api_version = "unit.test/v1"
+
+        lock_mock = AsyncMock(asyncio.Event)
+        lock_mock.wait.side_effect = asyncio.TimeoutError()
+
+        lookup_kind = f"unittest.{api_version}"
+        _lookup_locks[lookup_kind] = lock_mock
+
+        with self.assertRaises(Exception):
+            await get_full_kind(api_mock, "unittest", api_version)
+
+    async def test_lock_cleared_on_errors(self):
+        api_mock = AsyncMock(kr8s.asyncio.Api)
+        api_mock.lookup_kind.side_effect = ZeroDivisionError("Unit Test")
+
+        api_version = "unit.test/v1"
+
+        with self.assertRaises(ZeroDivisionError):
+            await get_full_kind(api_mock, "unittest", api_version)
+
+=== ./tests/controller/test_resource_hashing.py ===
+import copy
+import random
+import string
+import unittest
+
+from koreo.constants import PREFIX
+from controller.reconcile import _hash_resource
+
+
+def _generate_string(min_length, max_length):
+    return "".join(
+        random.choices(string.ascii_letters, k=random.randint(min_length, max_length))
+    )
+
+
+def _generate_random_dict(
+    size=10, max_depth=2, min_value_length=1, max_value_length=10
+):
+    def _generate_sub_structure(depth: int, type_selector: int = 0):
+        if not type_selector:
+            type_selector = random.randint(1, 3)
+
+        if type_selector == 1 and depth > 0:
+            return {
+                _generate_string(3, 15): _generate_sub_structure(depth=depth - 1)
+                for _ in range(random.randint(min_value_length, max_value_length))
+            }
+        elif type_selector == 2 and depth > 0:
+            list_value_type = random.randint(1, 3)
+            return [
+                _generate_sub_structure(depth=depth - 1, type_selector=list_value_type)
+                for _ in range(random.randint(min_value_length, max_value_length))
+            ]
+        else:
+            return _generate_string(min_value_length, max_value_length)
+
+    return {
+        _generate_string(3, 15): _generate_sub_structure(depth=max_depth)
+        for _ in range(size)
+    }
+
+
+def _generate_simple_map(
+    min_size=1, max_size=10, min_value_length=1, max_value_length=10
+):
+    size = random.randint(min_size, max_size)
+    if not size:
+        return None
+
+    return {
+        _generate_string(3, 20): _generate_string(min_value_length, max_value_length)
+        for _ in range(size)
+    }
+
+
+class TestResourceHashing(unittest.TestCase):
+    def test_simple_hash(self):
+        metadata = _generate_random_dict(
+            size=10, max_depth=2, min_value_length=5, max_value_length=20
+        )
+
+        metadata["labels"] = _generate_simple_map(
+            min_size=0, max_size=15, min_value_length=5, max_value_length=20
+        )
+        metadata["annotations"] = _generate_simple_map(
+            min_size=0, max_size=15, min_value_length=5, max_value_length=200
+        )
+
+        spec = _generate_random_dict(
+            size=10, max_depth=3, min_value_length=5, max_value_length=20
+        )
+
+        self.assertEqual(
+            _hash_resource({"metadata": metadata, "spec": spec}),
+            _hash_resource({"metadata": metadata, "spec": spec}),
+        )
+
+    def test_koreo_annotations_ignored(self):
+        metadata = _generate_random_dict(
+            size=10, max_depth=2, min_value_length=5, max_value_length=20
+        )
+        metadata2 = copy.copy(metadata)
+
+        annotations = _generate_simple_map(
+            min_size=1, max_size=15, min_value_length=5, max_value_length=200
+        )
+        metadata["annotations"] = copy.copy(annotations)
+
+        for i in range(random.randint(1, 10)):
+            annotations[f"{PREFIX}/{_generate_string(3, 5)}{i}"] = _generate_string(
+                5, 20
+            )
+        metadata2["annotations"] = annotations
+
+        spec = _generate_random_dict(
+            size=10, max_depth=3, min_value_length=5, max_value_length=20
+        )
+
+        self.assertEqual(
+            _hash_resource({"metadata": metadata, "spec": spec}),
+            _hash_resource({"metadata": metadata2, "spec": spec}),
+        )
+
+    def test_order_agnostic(self):
+        """Validate hashes match even if structures are reordered."""
+
+        # We want the basic metadata structure to match.
+        metadata = _generate_random_dict(
+            size=10, max_depth=2, min_value_length=5, max_value_length=20
+        )
+        metadata2 = copy.copy(metadata)
+
+        # Labels will match, but be reordered
+        labels = _generate_simple_map(
+            min_size=2, max_size=15, min_value_length=5, max_value_length=20
+        )
+        metadata["labels"] = labels
+        label_keys = list(labels.keys())
+        random.shuffle(label_keys)
+        metadata2["labels"] = {key: labels[key] for key in label_keys}
+
+        # Annotations will match, but be reordered
+        annotations = _generate_simple_map(
+            min_size=2, max_size=15, min_value_length=5, max_value_length=20
+        )
+        metadata["annotations"] = annotations
+        annotations_keys = list(annotations.keys())
+        random.shuffle(annotations_keys)
+        metadata2["annotations"] = {key: annotations[key] for key in annotations_keys}
+
+        # Spec will match, but the top-level structure will be reordered.
+        spec = _generate_random_dict(
+            size=10, max_depth=3, min_value_length=5, max_value_length=20
+        )
+        spec_keys = list(spec.keys())
+        random.shuffle(spec_keys)
+        spec2 = {key: spec[key] for key in spec_keys}
+
+        self.assertEqual(
+            _hash_resource({"metadata": metadata, "spec": spec}),
+            _hash_resource({"metadata": metadata2, "spec": spec2}),
+        )
+
+=== ./tests/controller/test_reconcile_cache_events.py ===
+from unittest.mock import AsyncMock
+import random
+import string
+import time
+import unittest
+
+import kr8s
+
+from controller.reconcile import get_event_handler
+
+
+def _get_name():
+    return "".join(
+        random.choices(population=string.ascii_lowercase, k=random.randint(5, 25))
+    )
+
+
+class TestCacher(unittest.IsolatedAsyncioTestCase):
+    async def test_cache_a_new_resource(self):
+        handler, update_queue = get_event_handler(namespace="unit-test")
+
+        self.assertEqual(0, update_queue.qsize())
+
+        fake_resource = AsyncMock(kr8s._objects.APIObject)
+
+        resource_name = _get_name()
+        resource_uid = _get_name()
+        fake_resource.name = resource_name
+
+        fake_resource.raw = {
+            "apiVersion": "unit.test/v1test1",
+            "kind": "UnitTest",
+            "metadata": {
+                "name": resource_name,
+                "namespace": "unit-test",
+                "uid": resource_uid,
+            },
+            "spec": {"value": _get_name()},
+        }
+
+        floor_time = time.monotonic()
+
+        await handler(
+            event="ADDED",
+            api_group="unit.test",
+            api_version="v1test1",
+            kind="UnitTest",
+            resource=fake_resource,
+        )
+
+        update_notification = await update_queue.get()
+
+        self.assertLessEqual(floor_time, update_notification.at)
+        self.assertEqual(0, update_notification.user_retries)
+        self.assertEqual(0, update_notification.sys_error_retries)
+
+        payload = update_notification.payload
+        self.assertEqual(payload.group, "unit.test")
+        self.assertEqual(payload.version, "v1test1")
+        self.assertEqual(payload.kind, "UnitTest")
+        self.assertEqual(payload.name, resource_name)
+        self.assertEqual(payload.namespace, "unit-test")
+
+    async def test_same_updates_pass_through(self):
+        handler, update_queue = get_event_handler(namespace="unit-test")
+
+        self.assertEqual(0, update_queue.qsize())
+
+        fake_resource = AsyncMock(kr8s._objects.APIObject)
+
+        resource_name = _get_name()
+        resource_uid = _get_name()
+        fake_resource.name = resource_name
+
+        fake_resource.raw = {
+            "apiVersion": "unit.test/v1test1",
+            "kind": "UnitTest",
+            "metadata": {
+                "name": resource_name,
+                "namespace": "unit-test",
+                "uid": resource_uid,
+            },
+        }
+
+        test_times = []
+
+        for _ in range(10):
+            test_times.append(time.monotonic())
+
+            await handler(
+                event="ADDED",
+                api_group="unit.test",
+                api_version="v1test1",
+                kind="UnitTest",
+                resource=fake_resource,
+            )
+
+        for min_time in test_times:
+            update_notification = await update_queue.get()
+
+            self.assertLessEqual(min_time, update_notification.at)
+            self.assertEqual(0, update_notification.user_retries)
+            self.assertEqual(0, update_notification.sys_error_retries)
+
+            payload = update_notification.payload
+            self.assertEqual(payload.group, "unit.test")
+            self.assertEqual(payload.version, "v1test1")
+            self.assertEqual(payload.kind, "UnitTest")
+            self.assertEqual(payload.name, resource_name)
+            self.assertEqual(payload.namespace, "unit-test")
+
+    async def test_delete(self):
+        handler, update_queue = get_event_handler(namespace="unit-test")
+
+        self.assertEqual(0, update_queue.qsize())
+
+        fake_resource = AsyncMock(kr8s._objects.APIObject)
+
+        resource_name = _get_name()
+        resource_uid = _get_name()
+        fake_resource.name = resource_name
+
+        fake_resource.raw = {
+            "apiVersion": "unit.test/v1test1",
+            "kind": "UnitTest",
+            "metadata": {
+                "name": resource_name,
+                "namespace": "unit-test",
+                "uid": resource_uid,
+            },
+        }
+
+        await handler(
+            event="DELETED",
+            api_group="unit.test",
+            api_version="v1test1",
+            kind="UnitTest",
+            resource=fake_resource,
+        )
+
+        self.assertEqual(0, update_queue.qsize())
+
+    async def test_post_delete_updates_ignored(self):
+        handler, update_queue = get_event_handler(namespace="unit-test")
+
+        self.assertEqual(0, update_queue.qsize())
+
+        fake_resource = AsyncMock(kr8s._objects.APIObject)
+
+        resource_name = _get_name()
+        resource_uid = _get_name()
+        fake_resource.name = resource_name
+
+        fake_resource.raw = {
+            "apiVersion": "unit.test/v1test1",
+            "kind": "UnitTest",
+            "metadata": {
+                "name": resource_name,
+                "namespace": "unit-test",
+                "uid": resource_uid,
+            },
+        }
+
+        await handler(
+            event="DELETED",
+            api_group="unit.test",
+            api_version="v1test1",
+            kind="UnitTest",
+            resource=fake_resource,
+        )
+
+        await handler(
+            event="ADDED",
+            api_group="unit.test",
+            api_version="v1test1",
+            kind="UnitTest",
+            resource=fake_resource,
+        )
+
+        self.assertEqual(0, update_queue.qsize())
+
+    async def test_readding_deleted_notifies(self):
+        handler, update_queue = get_event_handler(namespace="unit-test")
+
+        self.assertEqual(0, update_queue.qsize())
+
+        fake_resource = AsyncMock(kr8s._objects.APIObject)
+
+        resource_name = _get_name()
+        fake_resource.name = resource_name
+
+        fake_resource.raw = {
+            "apiVersion": "unit.test/v1test1",
+            "kind": "UnitTest",
+            "metadata": {
+                "name": resource_name,
+                "namespace": "unit-test",
+                "uid": _get_name(),
+            },
+        }
+
+        await handler(
+            event="DELETED",
+            api_group="unit.test",
+            api_version="v1test1",
+            kind="UnitTest",
+            resource=fake_resource,
+        )
+
+        fake_resource.raw["metadata"]["uid"] = _get_name()
+
+        floor_time = time.monotonic()
+        await handler(
+            event="ADDED",
+            api_group="unit.test",
+            api_version="v1test1",
+            kind="UnitTest",
+            resource=fake_resource,
+        )
+
+        update_notification = await update_queue.get()
+
+        self.assertLessEqual(floor_time, update_notification.at)
+        self.assertEqual(0, update_notification.user_retries)
+        self.assertEqual(0, update_notification.sys_error_retries)
+
+        payload = update_notification.payload
+        self.assertEqual(payload.group, "unit.test")
+        self.assertEqual(payload.version, "v1test1")
+        self.assertEqual(payload.kind, "UnitTest")
+        self.assertEqual(payload.name, resource_name)
+        self.assertEqual(payload.namespace, "unit-test")
+
+=== ./tests/controller/test_integration.py ===
+from typing import Iterable, Sequence
+from unittest.mock import AsyncMock
+import asyncio
+import random
+import time
+import unittest
+
+import kr8s.asyncio
+
+from controller import events
+from controller import kind_lookup
+from controller import scheduler
+
+
+def _lookup_kind(full_kind: str):
+    return (None, f"{full_kind.split('.')[0].lower()}s", None)
+
+
+class FakeResource:
+    def __init__(self, name: str, full_kind: str):
+        self.name = name
+        self.full_kind = full_kind
+
+
+def _simple_async_watcher(watch_source: dict[str, Sequence[FakeResource]]):
+    async def async_watch(kind: str, namespace: str):
+        for result in watch_source.get(kind, []):
+            yield "ADDED", result
+
+        # Simulate the watch waiting for updates
+        await asyncio.sleep(10)
+
+    return async_watch
+
+
+def _fake_resource_mapper(
+    kinds_and_counts: Iterable[tuple[str, str, int]],
+) -> dict[str, Sequence[FakeResource]]:
+    return {
+        f"{kind.lower()}s.{api_version}": [
+            FakeResource(f"resource-{r}", f"{kind.lower()}s.{api_version}")
+            for r in range(count)
+        ]
+        for api_version, kind, count in kinds_and_counts
+    }
+
+
+class TestIntegration(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        kind_lookup._reset()
+
+    async def test_events_and_scheduler(self):
+        mock_api = AsyncMock(kr8s.asyncio.Api)
+
+        mock_api.lookup_kind.side_effect = _lookup_kind
+
+        kind_watch_results = _fake_resource_mapper(
+            [
+                ("unit.test/v1test1", "One", random.randint(5, 25)),
+                ("unit.test/v1test1", "Two", random.randint(5, 25)),
+            ]
+        )
+
+        mock_api.async_watch.side_effect = _simple_async_watcher(kind_watch_results)
+
+        namespace = "unit-test"
+
+        request_queue = scheduler.RequestQueue[tuple[str, str]]()
+
+        async def event_handler(event: str, resource: kr8s._objects.APIObject, **_):
+            await request_queue.put(
+                scheduler.Request(
+                    at=time.monotonic(), payload=(resource.full_kind, resource.name)
+                )
+            )
+            return True
+
+        event_config = events.Configuration(
+            event_handler=event_handler,
+            namespace=namespace,
+        )
+
+        processed_counts = {}
+
+        async def work_processor(
+            payload: tuple[str, str], sys_error_retries: int, user_retries: int
+        ):
+            key = ":".join(payload)
+            processed_counts[key] = processed_counts.get(key, 0) + 1
+            return True
+
+        scheduler_config = scheduler.Configuration(work_processor=work_processor)
+
+        watch_queue = events.WatchQueue()
+
+        for kind in ["One", "Two"]:
+            await watch_queue.put(
+                events.WatchRequest(
+                    api_group="unit.test",
+                    api_version="v1test1",
+                    kind=kind,
+                    workflow="unit-test",
+                )
+            )
+
+        async with asyncio.timeout(0.1), asyncio.TaskGroup() as tg:
+            tg.create_task(
+                events.chief_of_the_watch(
+                    api=mock_api,
+                    tg=tg,
+                    watch_requests=watch_queue,
+                    configuration=event_config,
+                ),
+                name="chief-of-the-watch",
+            )
+
+            tg.create_task(
+                scheduler.orchestrator(
+                    tg=tg, requests=request_queue, configuration=scheduler_config
+                ),
+                name="reconcile-scheduler",
+            )
+
+            # Start the watches.
+            await asyncio.wait_for(watch_queue.join(), timeout=0.1)
+
+            # Let watch iterators run.
+            await asyncio.sleep(0)
+
+            # Ensure requests are processed.
+            await asyncio.wait_for(request_queue.join(), timeout=0.1)
+
+            # Stop watch sub-system.
+            await watch_queue.put(events.StopTheWatch())
+            await asyncio.wait_for(watch_queue.join(), timeout=0.1)
+
+            # Stop request management sub-system.
+            await request_queue.put(scheduler.Shutdown())
+            await asyncio.wait_for(request_queue.join(), timeout=0.1)
+
+        for item, count in processed_counts.items():
+            self.assertEqual(1, count, f"Wrong handle count ({count}) for `{item}`")
+
+=== ./tests/controller/test_events.py ===
+from typing import Iterable, Sequence
+from unittest.mock import AsyncMock, patch
+import asyncio
+import random
+import unittest
+
+import kr8s.asyncio
+
+from controller import kind_lookup
+from controller import events
+
+
+class FakeResource:
+    def __init__(self, name: str, full_kind: str):
+        self.name = name
+        self.full_kind = full_kind
+
+
+def _lookup_kind(full_kind: str):
+    return (None, f"{full_kind.split('.')[0].lower()}s", None)
+
+
+def _simple_async_watcher(watch_source: dict[str, Sequence[FakeResource]]):
+    async def async_watch(kind: str, namespace: str):
+        for result in watch_source.get(kind, []):
+            yield "ADDED", result
+
+        # Simulate the watch waiting for updates
+        await asyncio.sleep(10)
+
+    return async_watch
+
+
+def _fake_resource_mapper(
+    kinds_and_counts: Iterable[tuple[str, str, int]],
+) -> dict[str, Sequence[FakeResource]]:
+    return {
+        f"{kind.lower()}s.{api_version}": [
+            FakeResource(f"resource-{r}", f"{kind.lower()}s.{api_version}")
+            for r in range(count)
+        ]
+        for api_version, kind, count in kinds_and_counts
+    }
+
+
+class TestChiefOfTheWatch(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        kind_lookup._reset()
+
+    async def test_setup(self):
+        """
+        Start watches on several kinds, ensure the handler is called for each
+        resource.
+        """
+
+        mock_api = AsyncMock(kr8s.asyncio.Api)
+
+        mock_api.lookup_kind.side_effect = _lookup_kind
+
+        test_watches = random.randint(2, 10)
+
+        kind_watch_results = _fake_resource_mapper(
+            ("unit.test/v1test1", f"UnitTest{i}", random.randint(2, 10))
+            for i in range(test_watches)
+        )
+
+        mock_api.async_watch.side_effect = _simple_async_watcher(kind_watch_results)
+
+        kind_events_handeled = {
+            f"{kind}:{resource.name}": 0
+            for kind in kind_watch_results.keys()
+            for resource in kind_watch_results[kind]
+        }
+
+        async def event_handler(event: str, resource, **kwargs):
+            kind = resource.full_kind
+            name = resource.name
+            kind_events_handeled[f"{kind}:{name}"] += 1
+            return True
+
+        watch_requests = asyncio.Queue()
+
+        for i in range(test_watches):
+            await watch_requests.put(
+                events.WatchRequest(
+                    api_group="unit.test",
+                    api_version="v1test1",
+                    kind=f"UnitTest{i}",
+                    workflow=f"unit-test-workflow-{i}",
+                )
+            )
+
+        configuration = events.Configuration(
+            event_handler=event_handler,
+            namespace="unit-test",
+        )
+
+        async with asyncio.timeout(0.1), asyncio.TaskGroup() as tg:
+            chief_task = tg.create_task(
+                events.chief_of_the_watch(
+                    api=mock_api,
+                    tg=tg,
+                    watch_requests=watch_requests,
+                    configuration=configuration,
+                ),
+                name="chief-of-the-watch-unit-test",
+            )
+
+            await asyncio.wait_for(watch_requests.join(), timeout=0.1)
+            self.assertEqual(0, watch_requests.qsize())
+
+            await asyncio.sleep(0)
+            await watch_requests.put(events.StopTheWatch())
+
+        for resource, count in kind_events_handeled.items():
+            self.assertEqual(1, count, msg=f"Too many events {count} for {resource}.")
+
+        self.assertTrue(chief_task.done())
+        self.assertIsNone(chief_task.result())
+
+    async def test_multiple_watchers(self):
+        """
+        Request the same watch several times and ensure the watch restarts.
+        (idempotency)
+        """
+
+        mock_api = AsyncMock(kr8s.asyncio.Api)
+
+        mock_api.lookup_kind.side_effect = _lookup_kind
+
+        resource_queue: asyncio.Queue[FakeResource] = asyncio.Queue()
+        kind_watch_queues = {"unittests.unit.test/v1test1": resource_queue}
+
+        watch_call_count = 0
+
+        async def async_watch(kind: str, namespace: str):
+            nonlocal watch_call_count
+            watch_call_count += 1
+
+            queue = kind_watch_queues.get(kind)
+            if not queue:
+                return
+
+            while True:
+                yield "ADDED", await queue.get()
+
+        mock_api.async_watch.side_effect = async_watch
+
+        handled_event_count = 0
+
+        async def event_handler(event: str, resource, **kwargs):
+            nonlocal handled_event_count
+            handled_event_count += 1
+            return True
+
+        watch_requests = asyncio.Queue()
+
+        test_workflows = [
+            f"unit-test-workflow-{workflow_id}"
+            for workflow_id in range(random.randint(3, 15))
+        ]
+
+        for workflow_id in test_workflows:
+            await watch_requests.put(
+                events.WatchRequest(
+                    api_group="unit.test",
+                    api_version="v1test1",
+                    kind=f"UnitTest",
+                    workflow=workflow_id,
+                )
+            )
+
+        # Test removing some watchers
+        for workflow_id in test_workflows[1:]:
+            await watch_requests.put(events.CancelWatches(workflow=workflow_id))
+
+        configuration = events.Configuration(
+            event_handler=event_handler,
+            namespace="unit-test",
+        )
+
+        test_resource_events = random.randint(3, 15)
+
+        async with asyncio.timeout(0.1), asyncio.TaskGroup() as tg:
+            chief_task = tg.create_task(
+                events.chief_of_the_watch(
+                    api=mock_api,
+                    tg=tg,
+                    watch_requests=watch_requests,
+                    configuration=configuration,
+                ),
+                name="chief-of-the-watch-unit-test",
+            )
+
+            await asyncio.wait_for(watch_requests.join(), timeout=0.1)
+            self.assertEqual(0, watch_requests.qsize())
+
+            for r in range(test_resource_events):
+                await resource_queue.put(
+                    FakeResource(
+                        name=f"resource-{r}", full_kind="unittests.unit.test/v1test1"
+                    )
+                )
+
+            await asyncio.sleep(0)
+            await watch_requests.put(events.StopTheWatch())
+
+        # Watch (re)starts once per watch, and once for each removal. With one
+        # remaining.
+        self.assertEqual(len(test_workflows) * 2 - 1, watch_call_count)
+        self.assertEqual(test_resource_events, handled_event_count)
+
+        self.assertTrue(chief_task.done())
+        self.assertIsNone(chief_task.result())
+
+    async def test_update_watched_resource(self):
+        mock_api = AsyncMock(kr8s.asyncio.Api)
+
+        mock_api.lookup_kind.side_effect = _lookup_kind
+
+        kind_watch_results = _fake_resource_mapper(
+            [
+                ("unit.test/v1test1", f"Original", random.randint(2, 10)),
+                ("unit.test/v1test1", f"Update", random.randint(2, 10)),
+            ]
+        )
+
+        async def async_watch(kind: str, namespace: str):
+            # This is just to make the test clearer (delay sending resources)
+            if kind.startswith("original"):
+                await asyncio.sleep(1)
+
+            for result in kind_watch_results.get(kind, []):
+                yield "ADDED", result
+
+            # Simulate the watch waiting for updates
+            # with self.assertRaises(asyncio.CancelledError):
+            await asyncio.sleep(10)
+
+        mock_api.async_watch.side_effect = async_watch
+
+        kind_events_handeled = {
+            f"{kind}:{resource.name}": 0
+            for kind in kind_watch_results.keys()
+            for resource in kind_watch_results[kind]
+        }
+
+        async def event_handler(event: str, resource, **kwargs):
+            kind = resource.full_kind
+            name = resource.name
+
+            kind_events_handeled[f"{kind}:{name}"] += 1
+            return True
+
+        configuration = events.Configuration(
+            event_handler=event_handler,
+            namespace="unit-test",
+        )
+
+        watch_requests = asyncio.Queue()
+
+        async with asyncio.timeout(0.1), asyncio.TaskGroup() as tg:
+            chief_task = tg.create_task(
+                events.chief_of_the_watch(
+                    api=mock_api,
+                    tg=tg,
+                    watch_requests=watch_requests,
+                    configuration=configuration,
+                ),
+                name="chief-of-the-watch-unit-test",
+            )
+
+            # Start the "wrong" watch.
+            await watch_requests.put(
+                events.WatchRequest(
+                    api_group="unit.test",
+                    api_version="v1test1",
+                    kind="original",
+                    workflow=f"unit-test-workflow",
+                )
+            )
+            # Ensure it is processed.
+            await asyncio.wait_for(watch_requests.join(), timeout=0.1)
+
+            # Start the "right" watch.
+            await watch_requests.put(
+                events.WatchRequest(
+                    api_group="unit.test",
+                    api_version="v1test1",
+                    kind="update",
+                    workflow=f"unit-test-workflow",
+                )
+            )
+            # Ensure it is processed.
+            await asyncio.wait_for(watch_requests.join(), timeout=0.1)
+
+            # All watches ought to be procesed now.
+            self.assertEqual(0, watch_requests.qsize())
+
+            await watch_requests.put(events.StopTheWatch())
+            await asyncio.wait_for(watch_requests.join(), timeout=0.1)
+
+        for resource, count in kind_events_handeled.items():
+            if resource.startswith("original"):
+                expected_count = 0
+            else:
+                expected_count = 1
+            self.assertEqual(
+                expected_count, count, msg=f"Wrong event count for {resource}."
+            )
+
+        self.assertTrue(chief_task.done())
+        self.assertIsNone(chief_task.result())
+
+    async def test_workflow_deletion(self):
+        """Simulate the deletion of a workflow."""
+
+        mock_api = AsyncMock(kr8s.asyncio.Api)
+
+        mock_api.lookup_kind.side_effect = _lookup_kind
+
+        resource_queue: asyncio.Queue[FakeResource] = asyncio.Queue()
+        kind_watch_queues = {"unittests.unit.test/v1test1": resource_queue}
+
+        watch_call_count = 0
+
+        async def async_watch(kind: str, namespace: str):
+            nonlocal watch_call_count
+            watch_call_count += 1
+
+            queue = kind_watch_queues.get(kind)
+            if not queue:
+                return
+
+            while True:
+                yield "ADDED", await queue.get()
+                raise Exception("This should never fire.")
+
+        mock_api.async_watch.side_effect = async_watch
+
+        handled_event_count = 0
+
+        async def event_handler(event: str, resource, **kwargs):
+            nonlocal handled_event_count
+            handled_event_count += 1
+            return True
+
+        watch_requests = asyncio.Queue()
+
+        await watch_requests.put(
+            events.WatchRequest(
+                api_group="unit.test",
+                api_version="v1test1",
+                kind=f"UnitTest",
+                workflow=f"unit-test-workflow",
+            )
+        )
+
+        configuration = events.Configuration(
+            event_handler=event_handler,
+            namespace="unit-test",
+        )
+
+        test_resource_events = random.randint(3, 15)
+
+        async with asyncio.timeout(0.1), asyncio.TaskGroup() as tg:
+            chief_task = tg.create_task(
+                events.chief_of_the_watch(
+                    api=mock_api,
+                    tg=tg,
+                    watch_requests=watch_requests,
+                    configuration=configuration,
+                ),
+                name="chief-of-the-watch-unit-test",
+            )
+
+            await asyncio.wait_for(watch_requests.join(), timeout=0.1)
+            self.assertEqual(0, watch_requests.qsize())
+
+            await watch_requests.put(
+                events.CancelWatches(
+                    workflow=f"unit-test-workflow",
+                )
+            )
+
+            await asyncio.wait_for(watch_requests.join(), timeout=0.1)
+            self.assertEqual(0, watch_requests.qsize())
+            await asyncio.sleep(0)
+
+            for r in range(test_resource_events):
+                await resource_queue.put(
+                    FakeResource(
+                        name=f"resource-{r}", full_kind="unittests.unit.test/v1test1"
+                    )
+                )
+
+            await asyncio.sleep(0)
+            await watch_requests.put(events.StopTheWatch())
+
+        self.assertEqual(1, watch_call_count)  # Only called at setup
+        self.assertEqual(0, handled_event_count)  # Stopped before any events.
+
+        self.assertTrue(chief_task.done())
+        self.assertIsNone(chief_task.result())
+
+    async def test_watch_restarting(self):
+        """Watches auto-restart on error within handler."""
+
+        mock_api = AsyncMock(kr8s.asyncio.Api)
+
+        mock_api.lookup_kind.side_effect = _lookup_kind
+
+        watch_call_count = 0
+
+        async def async_watch(kind: str, namespace: str):
+            nonlocal watch_call_count
+            watch_call_count += 1
+
+            yield (
+                "ADDED",
+                FakeResource(name="unit-test", full_kind="unittests.unit.test/v1test1"),
+            )
+
+        mock_api.async_watch.side_effect = async_watch
+
+        handled_event_count = 0
+
+        async def event_handler(event: str, resource, **_):
+            nonlocal handled_event_count
+            handled_event_count += 1
+            raise Exception("unit-test-boom-boom")
+
+        watch_requests = asyncio.Queue()
+
+        await watch_requests.put(
+            events.WatchRequest(
+                api_group="unit.test",
+                api_version="v1test1",
+                kind=f"UnitTest",
+                workflow="unit-test-workflow",
+            )
+        )
+
+        max_errors = random.randint(3, 15)
+
+        configuration = events.Configuration(
+            event_handler=event_handler,
+            namespace="unit-test",
+            max_unknown_errors=max_errors,
+            retry_delay_base=0,
+            retry_delay_jitter=0,
+        )
+
+        async with asyncio.timeout(0.1), asyncio.TaskGroup() as tg:
+            chief_task = tg.create_task(
+                events.chief_of_the_watch(
+                    api=mock_api,
+                    tg=tg,
+                    watch_requests=watch_requests,
+                    configuration=configuration,
+                ),
+                name="chief-of-the-watch-unit-test",
+            )
+
+            await asyncio.wait_for(watch_requests.join(), timeout=0.1)
+
+            await watch_requests.put(events.StopTheWatch())
+
+        self.assertEqual(max_errors, watch_call_count)
+        self.assertEqual(max_errors, handled_event_count)
+
+        self.assertTrue(chief_task.done())
+        self.assertIsNone(chief_task.result())
+
+    @patch("asyncio.sleep")
+    async def test_watch_restarting_backoff(self, sleep_mock):
+        """Watches auto-restart on error within handler."""
+
+        mock_api = AsyncMock(kr8s.asyncio.Api)
+
+        mock_api.lookup_kind.side_effect = _lookup_kind
+
+        watch_call_count = 0
+
+        async def async_watch(kind: str, namespace: str):
+            nonlocal watch_call_count
+            watch_call_count += 1
+
+            yield (
+                "ADDED",
+                FakeResource(name="unit-test", full_kind="unittests.unit.test/v1test1"),
+            )
+
+        mock_api.async_watch.side_effect = async_watch
+
+        handled_event_count = 0
+
+        async def event_handler(event: str, resource, **_):
+            nonlocal handled_event_count
+            handled_event_count += 1
+            raise Exception("unit-test-boom-boom")
+
+        watch_requests = asyncio.Queue()
+
+        await watch_requests.put(
+            events.WatchRequest(
+                api_group="unit.test",
+                api_version="v1test1",
+                kind=f"UnitTest",
+                workflow="unit-test-workflow",
+            )
+        )
+
+        max_errors = random.randint(3, 15)
+        retry_base = random.randint(5, 50)
+        retry_delay_max = random.randint(100, 200)
+
+        configuration = events.Configuration(
+            event_handler=event_handler,
+            namespace="unit-test",
+            max_unknown_errors=max_errors,
+            retry_delay_base=retry_base,
+            retry_delay_jitter=0,
+            retry_delay_max=retry_delay_max,
+        )
+
+        async with asyncio.timeout(0.1), asyncio.TaskGroup() as tg:
+            chief_task = tg.create_task(
+                events.chief_of_the_watch(
+                    api=mock_api,
+                    tg=tg,
+                    watch_requests=watch_requests,
+                    configuration=configuration,
+                ),
+                name="chief-of-the-watch-unit-test",
+            )
+
+            await asyncio.wait_for(watch_requests.join(), timeout=0.1)
+
+            await watch_requests.put(events.StopTheWatch())
+
+        self.assertEqual(max_errors, watch_call_count)
+        self.assertEqual(max_errors, handled_event_count)
+
+        for retry, call_args in enumerate(sleep_mock.call_args_list):
+            expected_sleep = min(2**retry * retry_base, retry_delay_max)
+            self.assertEqual(expected_sleep, call_args.args[0])
+
+        self.assertEqual(max_errors - 1, sleep_mock.call_count)
+
+        self.assertTrue(chief_task.done())
+        self.assertIsNone(chief_task.result())
+
+=== ./tests/controller/test_workflow_registry.py ===
+import random
+import string
+import unittest
+
+from controller import workflow_registry
+
+
+def _name_generator(prefix: str):
+    return f"{prefix}-{''.join(random.choices(string.ascii_lowercase, k=15))}"
+
+
+class TestRegistry(unittest.TestCase):
+    def setUp(self):
+        workflow_registry._reset_registry()
+
+    def test_roundtrip(self):
+        custom_crd_name = _name_generator("crd")
+        workflow_name_one = _name_generator("workflow")
+        workflow_name_two = _name_generator("workflow")
+
+        workflow_registry.index_workflow_custom_crd(
+            workflow=workflow_name_one, custom_crd=custom_crd_name
+        )
+        workflow_registry.index_workflow_custom_crd(
+            workflow=workflow_name_two, custom_crd=custom_crd_name
+        )
+
+        workflows = workflow_registry.get_custom_crd_workflows(
+            custom_crd=custom_crd_name
+        )
+        self.assertIn(workflow_name_one, workflows)
+        self.assertIn(workflow_name_two, workflows)
+
+    def test_no_change_usage_reindex(self):
+        workflow_name = _name_generator("workflow")
+
+        custom_crd_name = _name_generator("crd")
+
+        workflow_registry.index_workflow_custom_crd(
+            workflow=workflow_name, custom_crd=custom_crd_name
+        )
+        workflow_registry.index_workflow_custom_crd(
+            workflow=workflow_name, custom_crd=custom_crd_name
+        )
+
+        self.assertEqual(
+            [workflow_name], workflow_registry.get_custom_crd_workflows(custom_crd_name)
+        )
+
+    def test_change_usage(self):
+        workflow_name = _name_generator("workflow")
+
+        custom_crd_name_one = _name_generator("crd")
+        custom_crd_name_two = _name_generator("crd")
+
+        workflow_registry.index_workflow_custom_crd(
+            workflow=workflow_name, custom_crd=custom_crd_name_one
+        )
+        workflow_registry.index_workflow_custom_crd(
+            workflow=workflow_name, custom_crd=custom_crd_name_two
+        )
+
+        self.assertNotIn(
+            workflow_name,
+            workflow_registry.get_custom_crd_workflows(custom_crd_name_one),
+        )
+        self.assertIn(
+            workflow_name,
+            workflow_registry.get_custom_crd_workflows(custom_crd_name_two),
+        )
+
+    def test_unindex(self):
+        workflow_name = _name_generator("workflow")
+
+        custom_crd_name = _name_generator("crd")
+
+        workflow_registry.index_workflow_custom_crd(
+            workflow=workflow_name, custom_crd=custom_crd_name
+        )
+
+        self.assertIn(
+            workflow_name,
+            workflow_registry.get_custom_crd_workflows(custom_crd_name),
+        )
+
+        workflow_registry.unindex_workflow_custom_crd(workflow=workflow_name)
+
+        self.assertNotIn(
+            workflow_name,
+            workflow_registry.get_custom_crd_workflows(custom_crd_name),
+        )
+
+    def test_noop_unindex(self):
+        workflow_name = _name_generator("workflow")
+        workflow_registry.unindex_workflow_custom_crd(workflow=workflow_name)
+
+    def test_unindex_one_of_multiple(self):
+        workflow_one_name = _name_generator("workflow-one")
+        workflow_two_name = _name_generator("workflow-two")
+
+        custom_crd_name = _name_generator("crd")
+
+        workflow_registry.index_workflow_custom_crd(
+            workflow=workflow_one_name, custom_crd=custom_crd_name
+        )
+        workflow_registry.index_workflow_custom_crd(
+            workflow=workflow_two_name, custom_crd=custom_crd_name
+        )
+
+        check_workflows = workflow_registry.get_custom_crd_workflows(custom_crd_name)
+        self.assertIn(workflow_one_name, check_workflows)
+        self.assertIn(workflow_two_name, check_workflows)
+
+        workflow_registry.unindex_workflow_custom_crd(workflow=workflow_one_name)
+
+        check_workflows = workflow_registry.get_custom_crd_workflows(custom_crd_name)
+        self.assertNotIn(workflow_one_name, check_workflows)
+        self.assertIn(workflow_two_name, check_workflows)
+
+=== ./tests/controller/test_reconciler.py ===
+from unittest.mock import AsyncMock, patch
+import random
+import string
+import unittest
+
+import kr8s
+
+from controller import reconcile
+
+
+def _get_name():
+    return "".join(
+        random.choices(population=string.ascii_lowercase, k=random.randint(5, 25))
+    )
+
+
+class TestReconcileResource(unittest.IsolatedAsyncioTestCase):
+    @patch("kr8s.asyncio.api")
+    async def test_reconcile_uncached_is_a_noop(self, api_mock):
+        resource = reconcile.Resource(
+            group="unit.test",
+            version="v1test1",
+            kind="UnitTest",
+            name=_get_name(),
+            namespace=_get_name(),
+        )
+        result = await reconcile.reconcile_resource(
+            payload=resource,
+            ok_frequency_seconds=60,
+            sys_error_retries=0,
+            user_retries=0,
+        )
+
+        self.assertIsNone(result)
+
+    @patch("kr8s.asyncio.api")
+    async def test_reconcile_cached(self, api_mock):
+        cacher, queue = reconcile.get_event_handler(namespace="unit-test")
+
+        resource_name = _get_name()
+        resource_uid = _get_name()
+
+        fake_resource = AsyncMock(kr8s._objects.APIObject)
+        fake_resource.name = resource_name
+        fake_resource.raw = {
+            "apiVersion": "unit.test/v1test1",
+            "kind": "UnitTest",
+            "metadata": {
+                "name": resource_name,
+                "namespace": "unit-test",
+                "uid": resource_uid,
+            },
+            "spec": {"value": _get_name()},
+        }
+
+        await cacher(
+            event="ADDED",
+            api_group="unit.test",
+            api_version="v1test1",
+            kind="UnitTest",
+            resource=fake_resource,
+        )
+
+        event = await queue.get()
+        queue.task_done()
+
+        resource = reconcile.Resource(
+            group="unit.test",
+            version="v1test1",
+            kind="UnitTest",
+            name=_get_name(),
+            namespace=_get_name(),
+        )
+
+        result = await reconcile.reconcile_resource(
+            payload=resource,
+            ok_frequency_seconds=60,
+            sys_error_retries=0,
+            user_retries=0,
+        )
+
+        self.assertIsNone(result)
+
+=== ./src/controller/custom_workflow.py ===
+import asyncio
+
+import kr8s.asyncio
+
+from controller import events
+from controller import scheduler
+from controller import reconcile
+
+
+async def workflow_controller_system(
+    api: kr8s.asyncio.Api,
+    namespace: str,
+    workflow_updates_queue: events.WatchQueue,
+):
+    event_handler, request_queue = reconcile.get_event_handler(namespace=namespace)
+
+    event_config = events.Configuration(
+        event_handler=event_handler, namespace=namespace
+    )
+
+    scheduler_config = scheduler.Configuration(
+        work_processor=reconcile.reconcile_resource
+    )
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(
+            events.chief_of_the_watch(
+                api=api,
+                tg=tg,
+                watch_requests=workflow_updates_queue,
+                configuration=event_config,
+            ),
+            name="workflow-chief-of-the-watch",
+        )
+
+        tg.create_task(
+            scheduler.orchestrator(
+                tg=tg, requests=request_queue, configuration=scheduler_config
+            ),
+            name="workflow-reconcile-scheduler",
+        )
+
+=== ./src/controller/events.py ===
+from typing import Literal, NamedTuple, Protocol
+import asyncio
+import logging
+import random
+
+import kr8s.asyncio
+
+from controller.kind_lookup import get_full_kind
+
+logger = logging.getLogger("koreo.controller.events")
+
+
+class WatchRequest(NamedTuple):
+    api_group: str
+    api_version: str
+    kind: str
+    workflow: str
+
+
+class CancelWatches(NamedTuple):
+    workflow: str
+
+
+class EventHandler(Protocol):
+    async def __call__(
+        self,
+        event: Literal["ADDED", "MODIFIED", "DELETED"],
+        api_group: str,
+        api_version: str,
+        kind: str,
+        resource: kr8s._objects.APIObject,
+    ): ...
+
+
+class Configuration(NamedTuple):
+    event_handler: EventHandler
+
+    namespace: str
+
+    reconnect_timeout: int = 600
+    reconnect_timeout_jitter: int = 60
+
+    missing_kind_retry_delay: int = 120
+
+    max_unknown_errors: int = 10
+
+    retry_delay_base: int = 10
+    retry_delay_jitter: int = 15
+    retry_delay_max: int = 300
+
+
+def _watch_key(api_version: str, kind: str):
+    return f"{kind}.{api_version}"
+
+
+class StartTheWatch:
+    """Used to indicate all instances of a resource should be reprocessed."""
+
+    pass
+
+
+class StopTheWatch:
+    """Used to indicate a resource no longer needs watched."""
+
+    pass
+
+
+WatchQueue = asyncio.Queue[WatchRequest | CancelWatches | StopTheWatch]
+
+
+async def chief_of_the_watch(
+    api: kr8s.asyncio.Api,
+    tg: asyncio.TaskGroup,
+    watch_requests: WatchQueue,
+    configuration: Configuration,
+):
+    watchstanders: dict[
+        str, tuple[asyncio.Task, asyncio.Queue[StartTheWatch | StopTheWatch]]
+    ] = {}
+
+    # These indexes are used for watcher-task cleanup.
+    workflow_watches: dict[str, str] = {}  # Workflow: Resource
+    resource_watchers: dict[str, set[str]] = {}  # Resource: set(Workflow)
+
+    while True:
+        watch_request = await watch_requests.get()
+        try:
+            match watch_request:
+                case StopTheWatch():
+                    for _, queue in watchstanders.values():
+                        try:
+                            queue.put_nowait(StopTheWatch())
+                        except (asyncio.QueueShutDown, asyncio.QueueFull):
+                            pass
+                    return
+
+                case CancelWatches(workflow=workflow):
+                    await _cancel_watch(
+                        workflow=workflow,
+                        watchstanders=watchstanders,
+                        workflow_watches=workflow_watches,
+                        resource_watchers=resource_watchers,
+                    )
+
+                case WatchRequest(
+                    api_group=api_group,
+                    api_version=api_version,
+                    kind=kind,
+                    workflow=workflow,
+                ):
+                    await _setup_watch(
+                        api=api,
+                        tg=tg,
+                        api_group=api_group,
+                        api_version=api_version,
+                        kind=kind,
+                        workflow=workflow,
+                        watchstanders=watchstanders,
+                        workflow_watches=workflow_watches,
+                        resource_watchers=resource_watchers,
+                        configuration=configuration,
+                    )
+                case _:
+                    logger.error(f"Invalid watch event {watch_request}!")
+        finally:
+            watch_requests.task_done()
+
+
+async def _cancel_watch(
+    workflow: str,
+    watchstanders: dict[str, tuple[asyncio.Task, asyncio.Queue]],
+    workflow_watches: dict[str, str],
+    resource_watchers: dict[str, set[str]],
+):
+    """WARNING: I mutate my arguments."""
+    watched = workflow_watches.pop(workflow, None)
+    if not watched:
+        # This workflow has no active watches.
+        logger.debug(f"Workflow {workflow} has no active watches to cancel.")
+        return
+
+    watchers = resource_watchers.get(watched)
+    if watchers:
+        watchers.remove(workflow)
+
+    # After removing this workflow, are there any others watching?
+    if not watchers:
+        # No. This was the only watcher, cleanup.
+        resource_watchers.pop(watched, None)
+
+    watchstander = watchstanders.get(watched)
+    if not watchstander:
+        # No watchstander
+        logger.debug(f"No watchstander for {watched} to cancel.")
+        return
+
+    _, queue = watchstander
+
+    if watchers:
+        # Watchers remain, restart in case actions are needed
+        await queue.put(StartTheWatch())
+        return
+
+    # No further need for this watch.
+    logger.debug(f"Stopping watch for {watched} as no watchers remain.")
+    await queue.put(StopTheWatch())
+    queue.shutdown()
+
+
+async def _setup_watch(
+    api: kr8s.asyncio.Api,
+    tg: asyncio.TaskGroup,
+    api_group: str,
+    api_version: str,
+    kind: str,
+    workflow: str,
+    watchstanders: dict[str, tuple[asyncio.Task, asyncio.Queue]],
+    workflow_watches: dict[str, str],
+    resource_watchers: dict[str, set[str]],
+    configuration: Configuration,
+):
+    """WARNING: I mutate my arguments."""
+    watchstander_key = _watch_key(
+        api_version=f"{api_group}/{api_version}",
+        kind=kind,
+    )
+
+    watched = workflow_watches.get(workflow)
+    if watched and watched != watchstander_key:
+        # This workflow was watching something else
+        await _cancel_watch(
+            workflow=workflow,
+            watchstanders=watchstanders,
+            workflow_watches=workflow_watches,
+            resource_watchers=resource_watchers,
+        )
+
+    workflow_watches[workflow] = watchstander_key
+    watchers = resource_watchers.get(watchstander_key)
+    if not watchers:
+        resource_watchers[watchstander_key] = set([workflow])
+    else:
+        watchers.add(workflow)
+
+    existing = watchstanders.get(watchstander_key)
+    if existing:
+        # There is already a watch on this resource. Restart it.
+        _, watchstander_queue = existing
+        await watchstander_queue.put(StartTheWatch())
+        return
+
+    watchstander_queue = asyncio.Queue()
+    watchstander_task = tg.create_task(
+        _watchstander_task(
+            api=api,
+            api_group=api_group,
+            version=api_version,
+            kind=kind,
+            command_queue=watchstander_queue,
+            configuration=configuration,
+        ),
+        name=f"watchstander-{watchstander_key}",
+    )
+    watchstanders[watchstander_key] = (
+        watchstander_task,
+        watchstander_queue,
+    )
+
+    def done(task):
+        logger.debug(f"Watch task {task.get_name()} is done")
+        watchstanders.pop(watchstander_key)
+
+    watchstander_task.add_done_callback(done)
+
+
+async def _watchstander_task(
+    api: kr8s.asyncio.Api,
+    api_group: str,
+    version: str,
+    kind: str,
+    command_queue: asyncio.Queue,
+    configuration: Configuration,
+):
+    name = f"{kind}.{api_group}.{version}"
+    restarts = 0
+    error_restarts = 0
+    while True:
+        # TODO: Use resource for setup, resource should include workflow id
+        # TODO: Race with restart to replay the wathc on workflow updates
+        watchstander_task = asyncio.create_task(
+            _watchstander(
+                api=api,
+                api_group=api_group,
+                version=version,
+                kind_title=kind,
+                configuration=configuration,
+            ),
+            name=f"watchstander-{name}-{restarts}-{error_restarts}",
+        )
+        restarts += 1
+
+        command_queue_task = asyncio.create_task(
+            command_queue.get(),
+            name=f"command-queue-{name}-{restarts}-{error_restarts}",
+        )
+
+        await asyncio.wait(
+            [watchstander_task, command_queue_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if watchstander_task.done():
+            if not command_queue_task.done():
+                command_queue_task.cancel()
+
+            if err := watchstander_task.exception():
+                if isinstance(err, (asyncio.CancelledError, KeyboardInterrupt)):
+                    raise err
+
+                delay = min(
+                    (2**error_restarts) * configuration.retry_delay_base
+                    + random.randint(0, configuration.retry_delay_jitter),
+                    configuration.retry_delay_max,
+                )
+
+                error_restarts += 1
+                if error_restarts < configuration.max_unknown_errors:
+                    logger.info(
+                        f"Waiting {delay} seconds before restarting the watch "
+                        f"for {name} due to error {err}"
+                    )
+
+                    await asyncio.sleep(delay)
+
+                    continue
+
+                logger.error(
+                    f"Too many errors watching `{name}`. Aborting due to `{err}`."
+                )
+                return
+
+        if command_queue_task.done():
+            if not watchstander_task.done():
+                watchstander_task.cancel()
+
+            if not command_queue_task.cancelled():
+                match command_queue_task.result():
+                    case StopTheWatch():
+                        logger.debug(f"Stopping the watch for {name}")
+                        return
+
+                    case StartTheWatch():
+                        # This is used to force the watchstander to restart.
+                        pass
+
+        error_restarts = 0
+
+
+async def _watchstander(
+    api: kr8s.asyncio.Api,
+    api_group: str,
+    version: str,
+    kind_title: str,
+    configuration: Configuration,
+):
+    api_version = f"{api_group}/{version}"
+
+    full_kind = await get_full_kind(api=api, kind=kind_title, api_version=api_version)
+
+    if not full_kind:
+        # QUESTION: Anything better to do here?
+        logger.warning(
+            f"Failed to find plural kind for `{kind_title}` in api group `{api_version}`."
+        )
+        await asyncio.sleep(configuration.missing_kind_retry_delay)
+        return
+
+    logger.info(f"Controller starting for `{full_kind}`.")
+
+    try:
+        watcher = api.async_watch(kind=full_kind, namespace=configuration.namespace)
+
+        async with asyncio.timeout(configuration.reconnect_timeout):
+            async for event, resource in watcher:
+                logger.debug(
+                    f"Handling {event} for `{full_kind}` object `{resource.name}`."
+                )
+                await configuration.event_handler(
+                    event=event,
+                    api_group=api_group,
+                    api_version=version,
+                    kind=kind_title,
+                    resource=resource,
+                )
+
+    except asyncio.CancelledError:
+        logger.debug(f"Cancelling `{full_kind}` watch.")
+        raise
+    except KeyboardInterrupt:
+        logger.debug(f"Shutdown `{full_kind}` watch.")
+        raise
+
+    except asyncio.TimeoutError:
+        logger.debug(f"Restarting `{full_kind}` watch due to timeout.")
+        # This is just to reduce some load on the API server if there's issue
+        await asyncio.sleep(
+            random.randint(15, max(30, configuration.reconnect_timeout_jitter))
+        )
+        return
+
+=== ./src/controller/koreo_cache.py ===
+import asyncio
+import logging
+import random
+
+import kr8s.asyncio
+
+from koreo.cache import delete_resource_from_cache, prepare_and_cache
+
+logger = logging.getLogger("koreo.controller.koreo_cache")
+
+MAX_SYS_ERRORS = 10
+
+RETRY_MAX_DELAY = 300
+RETRY_BASE_DELAY = 10
+RETRY_JITTER = 5
+
+
+async def load_cache(
+    api: kr8s.asyncio.Api,
+    namespace: str,
+    api_version: str,
+    plural_kind: str,
+    kind_title: str,
+    resource_class,
+    preparer,
+):
+    logger.debug(f"Building initial {plural_kind}.{api_version} cache.")
+
+    k8s_resource_class = kr8s.objects.new_class(
+        version=api_version,
+        kind=kind_title,
+        plural=plural_kind,
+        namespaced=True,
+        scalable=False,
+        asyncio=True,
+    )
+    resources = k8s_resource_class.list(api=api, namespace=namespace)
+
+    async for resource in resources:
+        logger.debug(f"Caching {resource.name}.")
+        await prepare_and_cache(
+            resource_class=resource_class,
+            preparer=preparer,
+            metadata=resource.metadata,
+            spec=resource.raw.get("spec", {}),
+        )
+
+    logger.debug(f"Initial {plural_kind}.{api_version} cache load complete.")
+
+
+async def maintain_cache(
+    api: kr8s.asyncio.Api,
+    namespace: str,
+    api_version: str,
+    plural_kind: str,
+    kind_title: str,
+    resource_class,
+    preparer,
+    reconnect_timeout: int = 900,
+):
+    logger.debug(f"Maintaining {plural_kind}.{api_version} Cache.")
+
+    k8s_resource_class = kr8s.objects.new_class(
+        version=api_version,
+        kind=kind_title,
+        plural=plural_kind,
+        namespaced=True,
+        scalable=False,
+        asyncio=True,
+    )
+
+    error_retries = 0
+
+    while True:
+        try:
+            watcher = api.async_watch(kind=k8s_resource_class, namespace=namespace)
+
+            async with asyncio.timeout(reconnect_timeout):
+                async for event, resource in watcher:
+                    if event == "DELETED":
+                        logger.debug(
+                            f"Deleting {plural_kind}.{api_version} from cache due to {event} for {resource.name}."
+                        )
+                        await delete_resource_from_cache(
+                            resource_class=resource_class,
+                            metadata=resource.metadata,
+                        )
+                        continue
+
+                    logger.debug(
+                        f"Updating {plural_kind}.{api_version} cache due to {event} for {resource.name}."
+                    )
+                    await prepare_and_cache(
+                        resource_class=resource_class,
+                        preparer=preparer,
+                        metadata=resource.metadata,
+                        spec=resource.raw.get("spec"),
+                    )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+        except asyncio.TimeoutError:
+            logger.debug(
+                f"Restarting {plural_kind}.{api_version} cache maintainer watch "
+                "due to normal reconnect timeout."
+            )
+            error_retries = 0
+        except:
+            logger.exception(
+                f"Restarting {plural_kind}.{api_version} cache maintainer watch."
+            )
+
+            error_retries += 1
+
+            if error_retries > MAX_SYS_ERRORS:
+                logger.error(f"Retry limit ({MAX_SYS_ERRORS}) exceeded.")
+                raise
+
+            # NOTE: This is just to prevent completely blowing up the API
+            # Server if there's an issue. It probably should have a back-off
+            # based on the last retry time.
+            await asyncio.sleep(
+                min((2**error_retries) * RETRY_BASE_DELAY, RETRY_MAX_DELAY)
+                + random.random() * RETRY_JITTER
+            )
+
+=== ./src/controller/workflow_registry.py ===
+from collections import defaultdict
+
+__workflow_custom_crd_index = defaultdict(str)
+__custom_crd_wokflow_index = defaultdict(set[str])
+
+
+def get_custom_crd_workflows(custom_crd: str) -> list[str]:
+    return list(__custom_crd_wokflow_index[custom_crd])
+
+
+def index_workflow_custom_crd(workflow: str, custom_crd: str):
+    prior_custom_crd = __workflow_custom_crd_index[workflow]
+
+    if prior_custom_crd == custom_crd:
+        return
+
+    if workflow in __custom_crd_wokflow_index[prior_custom_crd]:
+        __custom_crd_wokflow_index[prior_custom_crd].remove(workflow)
+
+    __custom_crd_wokflow_index[custom_crd].add(workflow)
+
+    __workflow_custom_crd_index[workflow] = custom_crd
+
+
+def unindex_workflow_custom_crd(workflow: str):
+    prior_custom_crd = __workflow_custom_crd_index[workflow]
+
+    if not prior_custom_crd:
+        return
+
+    if workflow in __custom_crd_wokflow_index[prior_custom_crd]:
+        __custom_crd_wokflow_index[prior_custom_crd].remove(workflow)
+
+    del __workflow_custom_crd_index[workflow]
+
+
+def _reset_registry():
+    global __workflow_custom_crd_index, __custom_crd_wokflow_index
+    __workflow_custom_crd_index = defaultdict(str)
+    __custom_crd_wokflow_index = defaultdict(set[str])
+
+=== ./src/controller/workflow_prepare_shim.py ===
+import asyncio
+import time
+import logging
+
+logger = logging.getLogger("koreo.workflow")
+
+from koreo import registry
+from koreo.cache import get_resource_from_cache
+from koreo.result import is_unwrapped_ok
+from koreo.workflow import prepare
+from koreo.workflow.structure import Workflow
+
+from controller.events import WatchQueue, CancelWatches, WatchRequest
+from controller.workflow_registry import (
+    index_workflow_custom_crd,
+    unindex_workflow_custom_crd,
+)
+
+_WORKFLOW_RECONCILERS: dict[str, asyncio.Task] = {}
+_DEREGISTERERS: dict[str, asyncio.Task] = {}
+
+
+def get_workflow_preparer():
+    workflow_update_queue = WatchQueue()
+
+    async def prepare_workflow(cache_key: str, spec: dict):
+        prepare_result = await prepare.prepare_workflow(cache_key=cache_key, spec=spec)
+
+        if not is_unwrapped_ok(prepare_result):
+            return prepare_result
+
+        workflow, watched = prepare_result
+
+        await _workflow_post_prepare(
+            workflow_update_queue=workflow_update_queue,
+            cache_key=cache_key,
+            workflow=workflow,
+        )
+
+        return workflow, watched
+
+    return prepare_workflow, workflow_update_queue
+
+
+async def _workflow_post_prepare(
+    workflow_update_queue: WatchQueue, cache_key: str, workflow: Workflow
+):
+    deletor_name = f"DeleteWorkflow:{cache_key}"
+    workflow_reconciler_name = f"WorkflowReconciler:{cache_key}"
+
+    if not workflow.crd_ref or not is_unwrapped_ok(workflow):
+        unindex_workflow_custom_crd(workflow=cache_key)
+
+        if deletor_name in _DEREGISTERERS:
+            # TODO: Is more needed here?
+            _DEREGISTERERS[deletor_name].cancel()
+            _WORKFLOW_RECONCILERS[workflow_reconciler_name].cancel()
+        return
+
+    if deletor_name not in _DEREGISTERERS:
+        delete_task = asyncio.create_task(
+            _deindex_crd_on_delete(cache_key=cache_key), name=deletor_name
+        )
+        _DEREGISTERERS[deletor_name] = delete_task
+        delete_task.add_done_callback(
+            lambda task: _DEREGISTERERS.__delitem__(task.get_name())
+        )
+
+    crd_ref = workflow.crd_ref
+    index_workflow_custom_crd(
+        workflow=cache_key,
+        custom_crd=f"{crd_ref.api_group}:{crd_ref.kind}:{crd_ref.version}",
+    )
+
+    if workflow_reconciler_name not in _WORKFLOW_RECONCILERS:
+        await workflow_update_queue.put(
+            WatchRequest(
+                api_group=crd_ref.api_group,
+                api_version=crd_ref.version,
+                kind=crd_ref.kind,
+                workflow=cache_key,
+            )
+        )
+        workflow_reconciler_task = asyncio.create_task(
+            _workflow_reconciler(
+                cache_key=cache_key, workflow_update_queue=workflow_update_queue
+            ),
+            name=workflow_reconciler_name,
+        )
+        _WORKFLOW_RECONCILERS[workflow_reconciler_name] = workflow_reconciler_task
+        workflow_reconciler_task.add_done_callback(
+            lambda task: _WORKFLOW_RECONCILERS.__delitem__(task.get_name())
+        )
+
+
+class WorkflowReconciler: ...
+
+
+async def _workflow_reconciler(workflow_update_queue: WatchQueue, cache_key: str):
+    workflow_reconciler_resource = registry.Resource(
+        resource_type=WorkflowReconciler, name=cache_key, namespace=None
+    )
+    queue = registry.register(workflow_reconciler_resource)
+
+    registry.subscribe(
+        subscriber=workflow_reconciler_resource,
+        resource=registry.Resource(
+            resource_type=Workflow, name=cache_key, namespace=None
+        ),
+    )
+
+    last_event = 0
+    while True:
+        try:
+            event = await queue.get()
+        except (asyncio.CancelledError, asyncio.QueueShutDown):
+            break
+
+        try:
+            match event:
+                case registry.Kill():
+                    break
+
+                case registry.ResourceEvent(event_time=event_time) if (
+                    event_time >= last_event
+                ):
+                    cached = get_resource_from_cache(
+                        resource_class=Workflow, cache_key=cache_key
+                    )
+
+                    if not cached or not is_unwrapped_ok(cached) or not cached.crd_ref:
+                        logger.error(f"Cancel CRD watches for Workflow {cache_key}")
+                        break
+
+                    await workflow_update_queue.put(
+                        WatchRequest(
+                            api_group=cached.crd_ref.api_group,
+                            api_version=cached.crd_ref.version,
+                            kind=cached.crd_ref.kind,
+                            workflow=cache_key,
+                        )
+                    )
+
+                    continue
+
+        finally:
+            queue.task_done()
+
+    registry.deregister(workflow_reconciler_resource, deregistered_at=time.monotonic())
+    await workflow_update_queue.put(CancelWatches(workflow=cache_key))
+
+
+class WorkflowDeleteor: ...
+
+
+async def _deindex_crd_on_delete(cache_key: str):
+    deletor_resource = registry.Resource(
+        resource_type=WorkflowDeleteor, name=cache_key, namespace=None
+    )
+    queue = registry.register(deletor_resource)
+
+    registry.subscribe(
+        subscriber=deletor_resource,
+        resource=registry.Resource(
+            resource_type=Workflow, name=cache_key, namespace=None
+        ),
+    )
+
+    last_event = 0
+    while True:
+        try:
+            event = await queue.get()
+        except (asyncio.CancelledError, asyncio.QueueShutDown):
+            break
+
+        try:
+            match event:
+                case registry.Kill():
+                    break
+                case registry.ResourceEvent(event_time=event_time) if (
+                    event_time >= last_event
+                ):
+                    cached = get_resource_from_cache(
+                        resource_class=Workflow, cache_key=cache_key
+                    )
+
+                    if cached:
+                        continue
+
+                    logger.debug(f"Deregistering CRD watches for Workflow {cache_key}")
+
+                    unindex_workflow_custom_crd(workflow=cache_key)
+
+                    break
+
+        finally:
+            queue.task_done()
+
+    registry.deregister(deletor_resource, deregistered_at=time.monotonic())
+
+=== ./src/controller/scheduler.py ===
+from typing import NamedTuple, Protocol, TypeVar
+import asyncio
+import heapq
+import logging
+import random
+import time
+
+from koreo.result import PermFail, UnwrappedOutcome, is_error
+
+logger = logging.getLogger("koreo.controller.scheduler")
+
+
+class WorkProcessor[T](Protocol):
+    async def __call__(
+        self,
+        payload: T,
+        ok_frequency_seconds: int,
+        sys_error_retries: int,
+        user_retries: int,
+    ) -> UnwrappedOutcome:
+        pass
+
+
+class Configuration[T](NamedTuple):
+    work_processor: WorkProcessor[T]
+
+    concurrency: int = 5
+
+    frequency_seconds: int = 5
+    timeout_seconds: int = 30
+
+    retry_max_retries: int = 10
+    retry_delay_base: int = 10
+    retry_delay_max: int = 300
+    retry_delay_jitter: int = 30
+
+
+class Request[T](NamedTuple):
+    at: float  # Timestamp to, approximately, run at
+
+    payload: T
+
+    user_retries: int = 0
+    sys_error_retries: int = 0
+
+
+class Shutdown(NamedTuple):
+    at: float = 0
+
+
+RequestPayload = TypeVar("RequestPayload")
+RequestQueue = asyncio.PriorityQueue[Request[RequestPayload] | Shutdown]
+
+
+async def orchestrator[T](
+    tg: asyncio.TaskGroup,
+    requests: RequestQueue[T],
+    configuration: Configuration[T],
+):
+    request_schedule: list[Request[T]] = []
+    heapq.heapify(request_schedule)
+
+    workers: set[asyncio.Task] = set()
+    workers_spawned = 0
+
+    work: asyncio.Queue[Request[T] | Shutdown] = asyncio.Queue()
+
+    while True:
+        # Ensure reconcilers are running
+        if len(workers) < max(configuration.concurrency, 1):
+            worker_task = tg.create_task(
+                _worker_task(
+                    work=work,
+                    requests=requests,
+                    configuration=configuration,
+                ),
+                name=f"worker-{workers_spawned}",
+            )
+            workers.add(worker_task)
+            worker_task.add_done_callback(workers.remove)
+            workers_spawned += 1
+            continue
+
+        if not request_schedule:
+            # This delay is to ensure the system is self-maintaining
+            next_scheduled_work = 120
+        else:
+            up_next = heapq.heappop(request_schedule)
+            next_scheduled_work = up_next.at - time.monotonic()
+            if next_scheduled_work <= 0:
+                await work.put(up_next)
+                continue
+
+            # Put next back into the queue so it gets picked up next time
+            heapq.heappush(request_schedule, up_next)
+
+        try:
+            new_work_request = await asyncio.wait_for(
+                requests.get(), timeout=next_scheduled_work
+            )
+            if isinstance(new_work_request, Shutdown):
+                # Shutdown and clear the requests queue.
+                requests.task_done()
+                requests.shutdown(immediate=True)
+
+                # Clear any pending work from the queue.
+                while True:
+                    try:
+                        work.get_nowait()
+                    except (asyncio.QueueEmpty, asyncio.QueueShutDown):
+                        break
+
+                # Add a shutdown for each worker.
+                for _ in workers:
+                    try:
+                        work.put_nowait(Shutdown())
+                    except (asyncio.QueueFull, asyncio.QueueShutDown):
+                        pass
+
+                # Shutdown the queue.
+                work.shutdown()
+                return
+
+            heapq.heappush(request_schedule, new_work_request)
+            requests.task_done()
+        except asyncio.TimeoutError:
+            # Indicates it is time to run the next scheduled reconciliation
+            continue
+
+
+async def _worker_task[T](
+    work: asyncio.Queue[Request[T] | Shutdown],
+    requests: asyncio.Queue[Request[T] | Shutdown],
+    configuration: Configuration,
+):
+    while True:
+        if shutdown := await _worker(
+            work=work,
+            requests=requests,
+            configuration=configuration,
+        ):
+            return
+
+
+async def _worker[T](
+    work: asyncio.Queue[Request[T] | Shutdown],
+    requests: asyncio.Queue[Request[T] | Shutdown],
+    configuration: Configuration,
+):
+    request = await work.get()
+    if isinstance(request, Shutdown):
+        # This is normally done in the try's finally block.
+        work.task_done()
+        return True
+
+    try:
+        result = await asyncio.wait_for(
+            configuration.work_processor(
+                request.payload,
+                ok_frequency_seconds=configuration.frequency_seconds,
+                sys_error_retries=request.sys_error_retries,
+                user_retries=request.user_retries,
+            ),
+            timeout=configuration.timeout_seconds,
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        raise
+
+    except:
+        logger.exception(
+            f"Exception within {configuration.work_processor.__qualname__} "
+            f"({request.sys_error_retries} retries)"
+        )
+
+        delay = min(
+            (2**request.sys_error_retries) * configuration.retry_delay_base
+            + random.randint(0, configuration.retry_delay_jitter),
+            configuration.retry_delay_max,
+        )
+
+        next_attempt_at = time.monotonic() + delay
+        sys_error_retries = request.sys_error_retries + 1
+
+        if sys_error_retries < configuration.retry_max_retries:
+            await requests.put(
+                Request(
+                    at=next_attempt_at,
+                    payload=request.payload,
+                    sys_error_retries=sys_error_retries,
+                    user_retries=0,
+                )
+            )
+        else:
+            # TODO: Exhausted retries... what now?
+            logger.error(
+                f"Exhausted retry limit within {configuration.work_processor.__qualname__} "
+                f"({request.sys_error_retries} retries)"
+            )
+
+        return False
+
+    finally:
+        work.task_done()
+
+    if not is_error(result):
+        if result is None:
+            return False
+
+        # Ok, Skip, or DepSkip. Recheck at scheduled frequency.
+        await requests.put(
+            Request(
+                at=time.monotonic() + configuration.frequency_seconds,
+                payload=request.payload,
+                sys_error_retries=0,
+                user_retries=0,
+            )
+        )
+        return False
+
+    if isinstance(result, PermFail):
+        logger.info(
+            f"PermFail from {configuration.work_processor.__qualname__} "
+            f"({request.user_retries} retries)"
+        )
+        return False
+
+    # User-requested Retry case
+    reconcile_at = time.monotonic() + result.delay
+
+    await requests.put(
+        Request(
+            at=reconcile_at,
+            payload=request.payload,
+            user_retries=request.user_retries + 1,
+            sys_error_retries=0,
+        )
+    )
+
+=== ./src/controller/reconcile.py ===
+from enum import StrEnum
+from typing import Awaitable, Callable, NamedTuple
+import asyncio
+import copy
+import hashlib
+import json
+import logging
+import time
+
+from celpy import celtypes
+import celpy
+import kr8s.asyncio
+
+from koreo.cache import get_resource_system_data_from_cache
+from koreo.constants import PREFIX
+from koreo.cel.encoder import convert_bools
+from koreo.conditions import Condition, update_condition
+from koreo.result import Ok, Outcome, PermFail, Retry, is_error, is_unwrapped_ok
+from koreo.workflow.reconcile import reconcile_workflow
+from koreo.workflow.structure import Workflow
+
+from controller.workflow_registry import get_custom_crd_workflows
+
+from controller import scheduler
+
+logger = logging.getLogger("koreo.controller.reconcile")
+
+STRIP_ANNOTATION_GROUPS = (
+    PREFIX,
+    "kubectl.kubernetes.io",
+)
+
+MISSING_WORKFLOW_RETRY = 120
+
+
+class AnnotationKeys(StrEnum):
+    managed_resources = f"{PREFIX}/managed-resources"
+    workflow = f"{PREFIX}/workflow"
+    merge_conditions = f"{PREFIX}/merge-conditions"
+
+
+class Resource(NamedTuple):
+    group: str
+    version: str
+    kind: str
+    name: str
+    namespace: str
+
+
+class LastReconcile(NamedTuple):
+    at: float
+    next_at: float
+
+    workflow_id: str | None = None
+
+    outcome: Outcome[float] | None = None
+
+    sys_error_retries: int = 0
+    user_retries: int = 0
+
+
+class CachedResource(NamedTuple):
+    resource_hash: str
+
+    locked_at: float
+    reconcile_lock: asyncio.Lock
+
+    cached: kr8s._objects.APIObject | None = None
+    last_reconcile: LastReconcile | None = None
+
+
+class DeletedTombstone(NamedTuple):
+    uid: str
+
+
+__resource_cache: dict[Resource, CachedResource | DeletedTombstone] = {}
+
+
+def _reset():
+    """Unit testing helper. Don't use in real code."""
+    __resource_cache.clear()
+
+
+def get_event_handler(namespace: str):
+    request_queue = scheduler.RequestQueue[Resource]()
+
+    async def event_handler(
+        event: str,
+        api_group: str,
+        api_version: str,
+        kind: str,
+        resource: kr8s._objects.APIObject,
+    ):
+        resource_key = Resource(
+            group=api_group,
+            version=api_version,
+            kind=kind,
+            name=resource.name,
+            namespace=namespace,
+        )
+        old_cache = __resource_cache.get(resource_key)
+
+        resource_uid = resource.raw.get("metadata", {}).get("uid")
+
+        if event == "DELETED":
+            __resource_cache[resource_key] = DeletedTombstone(uid=resource_uid)
+            return
+
+        resource_hash = _hash_resource(resource.raw)
+
+        if isinstance(old_cache, DeletedTombstone):
+            if old_cache.uid == resource_uid:
+                # NoOp; stale event for a deleted resource.
+                return
+
+            old_cache = None
+
+        if not old_cache:
+            __resource_cache[resource_key] = CachedResource(
+                resource_hash=resource_hash,
+                cached=resource,
+                locked_at=0,
+                reconcile_lock=asyncio.Lock(),
+            )
+        elif old_cache.resource_hash != resource_hash:
+            __resource_cache[resource_key] = CachedResource(
+                resource_hash=resource_hash,
+                cached=resource,
+                locked_at=0,
+                reconcile_lock=old_cache.reconcile_lock,
+            )
+
+        await request_queue.put(
+            scheduler.Request(at=time.monotonic(), payload=resource_key)
+        )
+
+    return event_handler, request_queue
+
+
+def _hash_resource(resource: dict):
+    """
+    Compute a hash of the resource to determine if anything is different since
+    the last reconcile. This hash is computed using the full spec, plus
+    metadata labels and annotations (excluding koreo annotations).
+    """
+    metadata = resource.get("metadata", {})
+    spec = resource.get("spec", {})
+
+    non_koreo_annotations = metadata.get("annotations")
+    if non_koreo_annotations:
+        non_koreo_annotations = {
+            key: value
+            for key, value in non_koreo_annotations.items()
+            if not key.startswith(STRIP_ANNOTATION_GROUPS)
+        }
+
+    hash_worthy_resource = {
+        "metadata": {
+            "labels": metadata.get("labels"),
+            "annotations": non_koreo_annotations,
+        },
+        "spec": spec,
+    }
+
+    return hashlib.sha256(
+        json.dumps(hash_worthy_resource, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+async def reconcile_resource(
+    payload: Resource,
+    ok_frequency_seconds: int,
+    sys_error_retries: int,
+    user_retries: int,
+):
+    api = await kr8s.asyncio.api()
+
+    if not (cached_resource := _load_cached_resource(payload)):
+        return None
+
+    # This is for linters, it is checked in _load_cached_resource
+    assert cached_resource.cached
+
+    cached_metadata = cached_resource.cached.raw.get("metadata", {})
+
+    if not cached_metadata:
+        # TODO: Attempt to load from cluster?
+        logger.error(f"Corrupt cached resource is missing metadata ({payload}).")
+        return None
+
+    merge_conditions = (
+        cached_metadata.get("annotations", {}).get(
+            AnnotationKeys.merge_conditions, "false"
+        )
+        == "true"
+    )
+
+    if merge_conditions:
+        conditions = cached_resource.cached.raw.get("status", {}).get("conditions", [])
+    else:
+        conditions: list[Condition] = []
+
+    match _lookup_workflow_for_resource(
+        resource=payload,
+        annotations=cached_metadata.get("annotations", {}),
+        conditions=conditions,
+    ):
+        case WorkflowLookupError(
+            message=message, result=result, patch_value=patch_value
+        ):
+            logger.warning(f"Workflow lookup error: {message}")
+            try:
+                await cached_resource.cached.async_patch(patch_value)
+            except kr8s.NotFoundError:
+                logger.info(f"{payload} was deleted.")
+                __resource_cache[payload] = DeletedTombstone(
+                    uid=cached_metadata.get("uid")
+                )
+                return None
+
+            return result
+        case LoadedWorkflow(workflow=workflow, version=workflow_version):
+            # The workflow is used later as well.
+            workflow_id = f"{workflow.name}:{workflow_version}"
+
+    owner = (
+        f"{cached_resource.cached.namespace}",
+        {
+            "apiVersion": f"{payload.group}/{payload.version}",
+            "kind": payload.kind,
+            "blockOwnerDeletion": True,
+            "controller": False,
+            "name": cached_metadata.get("name"),
+            "uid": cached_metadata.get("uid"),
+        },
+    )
+
+    cached_spec = cached_resource.cached.raw.get("spec")
+    cached_state = cached_resource.cached.raw.get("status", {}).get("state")
+
+    trigger = celpy.json_to_cel(
+        {"metadata": cached_metadata, "spec": cached_spec, "state": cached_state}
+    )
+
+    if not (
+        reconcile_lock := _check_cache_and_get_lock(
+            payload, cached_resource.resource_hash, workflow_id
+        )
+    ):
+        return None
+
+    logger.info(f"Reconciling {payload} using Workflow {workflow.name}.")
+
+    async with reconcile_lock:
+        __resource_cache[payload] = copy.replace(
+            __resource_cache[payload], locked_at=time.monotonic()
+        )
+        try:
+            reconcile_outcome = await reconcile_with_workflow(
+                api=api,
+                workflow=workflow,
+                owner=owner,
+                trigger=trigger,
+                conditions=conditions,
+                patch=cached_resource.cached.async_patch,
+            )
+        except kr8s.NotFoundError:
+            logger.info(f"{payload} was deleted during reconcile.")
+            __resource_cache[payload] = DeletedTombstone(uid=cached_metadata.get("uid"))
+            return None
+
+    if not (cache_check := _basic_load_cached_resource(payload)):
+        return None
+
+    if cache_check.resource_hash != cached_resource.resource_hash:
+        # The update should already have inserted a new reconcile request.
+        logger.info(
+            f"Skipping cache and conditions update because {payload} was "
+            "updated while reconciling."
+        )
+        return None
+
+    if cache_check.last_reconcile != cached_resource.last_reconcile:
+        # Resource was reconciled by another worker too. Don't propagate.
+        logger.info(f"{payload} was reconciled by another worker while reconciling.")
+        return None
+
+    if isinstance(reconcile_outcome, Retry):
+        next_reconcile_delay = reconcile_outcome.delay
+    else:
+        next_reconcile_delay = ok_frequency_seconds
+
+    __resource_cache[payload] = CachedResource(
+        resource_hash=cache_check.resource_hash,
+        cached=cache_check.cached,
+        locked_at=0,
+        reconcile_lock=cache_check.reconcile_lock,
+        last_reconcile=LastReconcile(
+            at=time.monotonic(),
+            next_at=time.monotonic() + next_reconcile_delay,
+            workflow_id=workflow_id,
+            outcome=reconcile_outcome,
+            sys_error_retries=sys_error_retries,
+            user_retries=user_retries,
+        ),
+    )
+
+    return reconcile_outcome
+
+
+def _load_cached_resource(resource: Resource) -> CachedResource | None:
+    if not (cached_resource := _basic_load_cached_resource(resource)):
+        return None
+
+    if not cached_resource.cached:
+        # TODO: Attempt to load from cluster?
+        logger.error(f"Missing cached resource ({resource}).")
+        return None
+
+    if cached_resource.reconcile_lock.locked() and (
+        time.monotonic() - cached_resource.locked_at < 60
+    ):
+        logger.debug(f"{resource} is currently being reconciled by another worker.")
+        return None
+
+    return cached_resource
+
+
+def _check_cache_and_get_lock(
+    resource: Resource,
+    resource_hash: str,
+    workflow_id: str,
+) -> asyncio.Lock | None:
+    if not (cached_resource := _basic_load_cached_resource(resource)):
+        return None
+
+    if cached_resource.resource_hash != resource_hash:
+        # The update should already have inserted a new reconcile request.
+        logger.info(
+            f"Aborting reconcile because {resource} updated while looking up workflow."
+        )
+        return None
+
+    # It has never been reconciled, we're good to go.
+    if not cached_resource.last_reconcile:
+        return cached_resource.reconcile_lock
+
+    last_reconcile = cached_resource.last_reconcile
+
+    # Was not reconciled by this workflow, we're good to go.
+    if last_reconcile.workflow_id != workflow_id:
+        return cached_resource.reconcile_lock
+
+    if isinstance(last_reconcile.outcome, PermFail):
+        # PermFail should wait for a resource or workflow change, that's not
+        # the case here.
+        logger.info(
+            f"{resource} in PermFail state, will not reattempt reconcile "
+            "without an update to the resource or workflow."
+        )
+        return None
+
+    seconds_to_wait = round(last_reconcile.next_at - time.monotonic())
+
+    # Last outcome was a retry, need to check how close we are to decide.
+    if isinstance(last_reconcile.outcome, Retry):
+        if seconds_to_wait:
+            return None
+
+        return cached_resource.reconcile_lock
+
+    if seconds_to_wait > 5:
+        logger.debug(
+            f"{resource} reconciled to `{last_reconcile.outcome}`, "
+            f"not ready for a re-reconcile for {seconds_to_wait} seconds."
+        )
+        return None
+
+    # No lock, we're good to go.
+    if not cached_resource.reconcile_lock.locked():
+        return cached_resource.reconcile_lock
+
+    # If the lock is not "stuck", skip this reconcile.
+    if time.monotonic() - cached_resource.locked_at < 60:
+        logger.debug(f"{resource} is being reconciled by another worker.")
+        return None
+
+    logger.warning(f"Releasing stuck reconcile lock for {resource}.")
+    try:
+        cached_resource.reconcile_lock.release()
+    except RuntimeError:
+        pass
+
+    return cached_resource.reconcile_lock
+
+
+def _basic_load_cached_resource(resource: Resource) -> CachedResource | None:
+    cached_resource = __resource_cache.get(resource)
+    if not cached_resource:
+        # TODO: Attempt to load from cluster?
+        logger.error(f"Failed to find resource in cache ({resource}).")
+        return None
+
+    if isinstance(cached_resource, DeletedTombstone):
+        logger.debug(f"{resource} was deleted from cluster.")
+        return None
+
+    return cached_resource
+
+
+class LoadedWorkflow(NamedTuple):
+    workflow: Workflow
+    version: str
+
+
+class WorkflowLookupError(NamedTuple):
+    message: str
+    result: Retry
+    patch_value: dict
+
+
+def _lookup_workflow_for_resource(
+    resource: Resource,
+    annotations: dict[str, str],
+    conditions: list[Condition] | None,
+) -> LoadedWorkflow | WorkflowLookupError:
+    crd_key = f"{resource.group}:{resource.kind}:{resource.version}"
+
+    user_specified_workflow = annotations.get(AnnotationKeys.workflow)
+    if user_specified_workflow:
+        logger.debug(
+            f"Looking up user-specified workflow ({user_specified_workflow}) for `{crd_key}`"
+        )
+        cached_workflow = get_resource_system_data_from_cache(
+            resource_class=Workflow, cache_key=user_specified_workflow
+        )
+
+        if not cached_workflow:
+            message = f"Failed to find User Requested Workflow ({user_specified_workflow}) for `{crd_key}`"
+            condition = Condition(
+                type="Ready",
+                reason="NoWorkflow",
+                message=message,
+                status="false",
+                location="custom_workflow._lookup_workflow_for_resource",
+            )
+
+            return WorkflowLookupError(
+                message=message,
+                result=Retry(message=message, delay=MISSING_WORKFLOW_RETRY),
+                patch_value={
+                    "status": {
+                        "conditions": update_condition(
+                            conditions=conditions, condition=condition
+                        ),
+                        "koreo": {
+                            "errors": message,
+                            "locations": f"custom_workflow._lookup_workflow_for_resource({crd_key})",
+                        },
+                    }
+                },
+            )
+
+        if is_unwrapped_ok(cached_workflow.resource):
+            return LoadedWorkflow(
+                workflow=cached_workflow.resource,
+                version=f"{cached_workflow.prepared_at}",
+            )
+
+        message = f"User-specified Workflow `{user_specified_workflow}` not ready {cached_workflow.resource.message}."
+        condition = Condition(
+            type="Ready",
+            reason="WorkflowNotReady",
+            message=message,
+            status="false",
+            location="custom_workflow._lookup_workflow_for_resource<user-specified>",
+        )
+
+        return WorkflowLookupError(
+            message=message,
+            result=Retry(message=message, delay=MISSING_WORKFLOW_RETRY),
+            patch_value={
+                "status": {
+                    "conditions": update_condition(
+                        conditions=conditions, condition=condition
+                    ),
+                    "koreo": {
+                        "errors": message,
+                        "locations": "custom_workflow._lookup_workflow_for_resource<user-specified>",
+                    },
+                }
+            },
+        )
+
+    logger.debug(f"Looking up workflow(s) for {crd_key}")
+    workflow_keys = get_custom_crd_workflows(custom_crd=crd_key)
+    if not workflow_keys:
+        message = f"Failed to find Workflow for `{crd_key}`"
+        condition = Condition(
+            type="Ready",
+            reason="NoWorkflow",
+            message=message,
+            status="false",
+            location="custom_workflow._lookup_workflow_for_resource",
+        )
+
+        return WorkflowLookupError(
+            message=message,
+            result=Retry(message=message, delay=MISSING_WORKFLOW_RETRY),
+            patch_value={
+                "status": {
+                    "conditions": update_condition(
+                        conditions=conditions, condition=condition
+                    ),
+                    "koreo": {
+                        "errors": message,
+                        "locations": f"custom_workflow.reconcile({crd_key})",
+                    },
+                }
+            },
+        )
+
+    if len(workflow_keys) > 1:
+        message = f"Multiple Workflows attempted to run ({','.join(workflow_keys)})"
+        condition = Condition(
+            type="Ready",
+            reason="MultipleWorkflows",
+            message=message,
+            status="false",
+            location=f"{';'.join(workflow_keys)}",
+        )
+
+        return WorkflowLookupError(
+            message=message,
+            result=Retry(message=message, delay=MISSING_WORKFLOW_RETRY),
+            patch_value={
+                "status": {
+                    "conditions": update_condition(
+                        conditions=conditions, condition=condition
+                    ),
+                    "koreo": {
+                        "errors": message,
+                        "locations": f"{';'.join(workflow_keys)}",
+                    },
+                }
+            },
+        )
+
+    workflow_key, *_ = workflow_keys
+
+    cached_workflow = get_resource_system_data_from_cache(
+        resource_class=Workflow, cache_key=workflow_key
+    )
+
+    if not cached_workflow:
+        message = f"Could not load Workflow `{workflow_key}`."
+        condition = Condition(
+            type="Ready",
+            reason="WorkflowNotInCache",
+            message=message,
+            status="false",
+            location="custom_workflow._lookup_workflow_for_resource",
+        )
+
+        return WorkflowLookupError(
+            message=message,
+            result=Retry(message=message, delay=MISSING_WORKFLOW_RETRY),
+            patch_value={
+                "status": {
+                    "conditions": update_condition(
+                        conditions=conditions, condition=condition
+                    ),
+                    "koreo": {
+                        "errors": message,
+                        "locations": "custom_workflow._lookup_workflow_for_resource",
+                    },
+                }
+            },
+        )
+
+    if not is_unwrapped_ok(cached_workflow.resource):
+        message = (
+            f"Workflow `{workflow_key}` not ready {cached_workflow.resource.message}."
+        )
+        condition = Condition(
+            type="Ready",
+            reason="WorkflowNotReady",
+            message=message,
+            status="false",
+            location="custom_workflow._lookup_workflow_for_resource",
+        )
+
+        return WorkflowLookupError(
+            message=message,
+            result=Retry(message=message, delay=MISSING_WORKFLOW_RETRY),
+            patch_value={
+                "status": {
+                    "conditions": update_condition(
+                        conditions=conditions, condition=condition
+                    ),
+                    "koreo": {
+                        "errors": message,
+                        "locations": "custom_workflow._lookup_workflow_for_resource",
+                    },
+                }
+            },
+        )
+
+    return LoadedWorkflow(
+        workflow=cached_workflow.resource, version=f"{cached_workflow.prepared_at}"
+    )
+
+
+async def reconcile_with_workflow(
+    api: kr8s.asyncio.Api,
+    workflow: Workflow,
+    owner: tuple[str, dict],
+    trigger: celtypes.Value,
+    conditions: list[Condition],
+    patch: Callable[..., Awaitable],
+):
+    workflow_result = await reconcile_workflow(
+        api=api,
+        workflow_key=workflow.name,
+        owner=owner,
+        trigger=trigger,
+        workflow=workflow,
+    )
+
+    outcome = workflow_result.result
+    resource_ids = workflow_result.resource_ids
+    state = workflow_result.state
+    state_errors = workflow_result.state_errors
+
+    for condition in workflow_result.conditions:
+        conditions = update_condition(conditions=conditions, condition=condition)
+
+    encoded_resource_ids = json.dumps(resource_ids, separators=(",", ":"), indent=None)
+
+    object_patch = {
+        "metadata": {
+            "annotations": {AnnotationKeys.managed_resources: encoded_resource_ids}
+        },
+        "status": {
+            "conditions": conditions,
+            "state": convert_bools(state),
+        },
+    }
+
+    if is_error(outcome):
+        object_patch["status"]["koreo"] = {
+            "errors": outcome.message,
+            "locations": outcome.location,
+            "state_errors": state_errors if state_errors else None,
+        }
+        await patch(object_patch)
+
+        return outcome
+
+    koreo_value = {
+        "errors": None,
+        "locations": None,
+        "state_errors": state_errors if state_errors else None,
+    }
+    object_patch["status"]["koreo"] = koreo_value
+
+    await patch(object_patch)
+
+    return Ok(time.monotonic())
+
+=== ./src/controller/kind_lookup.py ===
+import asyncio
+import logging
+
+import kr8s.asyncio
+
+logger = logging.getLogger("koreo.controller.resource")
+
+LOOKUP_TIMEOUT = 15
+
+_plural_map: dict[str, str] = {}
+
+_lookup_locks: dict[str, asyncio.Event] = {}
+_lookup_locks_guard = asyncio.Lock()
+
+
+async def get_full_kind(
+    api: kr8s.asyncio.Api, kind: str, api_version: str
+) -> str | None:
+    lookup_kind = f"{kind}.{api_version}"
+
+    async def wait_for_result(lookup_lock: asyncio.Event) -> str | None:
+        """Wait for the lookup lock to be set and return the full kind."""
+        logger.debug(f"Waiting for plural kind lookup lock for {lookup_kind}")
+        await lookup_lock.wait()
+        if lookup_kind in _plural_map:
+            logger.debug(f"Received plural kind for {lookup_kind} after waiting.")
+            return _plural_map[lookup_kind]
+        raise Exception(f"Waiting on {lookup_kind} failed.")
+
+    async def get_result(lookup_lock: asyncio.Event) -> str | None:
+        attempts = 3
+        try:
+            for attempt in range(1, attempts):
+                logger.debug(f"Attempting to find plural kind for {lookup_kind} (attempt {attempt} of {attempts})")
+                try:
+                    async with asyncio.timeout(LOOKUP_TIMEOUT):
+                        try:
+                            (_, plural_kind, _) = await api.lookup_kind(lookup_kind)
+                            break
+                        except ValueError as e:
+                            logger.debug(
+                                    f"Failed to find plural kind for {lookup_kind} on attempt {attempt}: {e}"
+                            )
+                            logger.exception(
+                                f"Failed to find Kind (`{lookup_kind}`) information. Can not start controller!"
+                            )
+                            return None
+                except asyncio.TimeoutError:
+                    logger.debug(
+                        f"Timed out while looking up plural kind for {lookup_kind} on attempt {attempt}"
+                    )
+                    continue
+            else:
+                logger.error(
+                    f"Too many failed attempts to find plural kind for {lookup_kind}."
+                )
+                raise Exception(
+                    f"Too many failed attempts to find plural kind for {lookup_kind}"
+                )
+            logger.debug(f"Found plural kind for {lookup_kind}: {plural_kind}")
+            full_kind = f"{plural_kind}.{api_version}"
+            logger.debug(f"Setting plural kind for {lookup_kind} to {full_kind}")
+            _plural_map[lookup_kind] = full_kind
+            return full_kind
+        finally:
+            logger.debug(f"Cleaning up locks and triggering event for {lookup_kind}")
+            lookup_lock.set()
+            del _lookup_locks[lookup_kind]
+
+    if lookup_kind in _plural_map:
+        return _plural_map[lookup_kind]
+
+    async with _lookup_locks_guard:
+        if lookup_kind in _lookup_locks:
+            lookup_lock = _lookup_locks[lookup_kind]
+            return await wait_for_result(lookup_lock)
+        else:
+            lookup_lock = asyncio.Event()
+            _lookup_locks[lookup_kind] = lookup_lock
+            return await get_result(lookup_lock)
+
+
+def _reset():
+    """Helper for unit testing; not intended for usage in normal code."""
+    _plural_map.clear()
+
+    for lock in _lookup_locks.values():
+        lock.set()
+
+    _lookup_locks.clear()
+
+=== ./src/controller/load_schemas.py ===
+import asyncio
+import kr8s.asyncio
+
+from koreo import schema
+from koreo.constants import API_GROUP, DEFAULT_API_VERSION
+
+API_VERSION = f"{API_GROUP}/{DEFAULT_API_VERSION}"
+
+KINDS = [
+    ("FunctionTest", "functiontests"),
+    ("ResourceFunction", "resourcefunctions"),
+    ("ResourceTemplate", "resourcetemplates"),
+    ("ValueFunction", "valuefunctions"),
+    ("Workflow", "workflows"),
+]
+
+
+async def load_koreo_resource_schemas(api: kr8s.asyncio.Api):
+    async with asyncio.TaskGroup() as tg:
+        for kind, plural in KINDS:
+            tg.create_task(
+                _load_schema_for_kind(api, kind, plural), name=f"schema-loader-{kind}"
+            )
+
+
+async def _load_schema_for_kind(api: kr8s.asyncio.Api, kind: str, plural: str):
+    crd = await kr8s.asyncio.objects.CustomResourceDefinition.get(
+        api=api, name=f"{plural}.{API_GROUP}"
+    )
+    schema.load_validator(kind, crd.raw)
+
+=== ./src/koreo_controller.py ===
+import json
+import logging
+import os
+
+import asyncio
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        record_dict = {
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "name": record.name,
+            "time": self.formatTime(record),
+        }
+        return json.dumps(record_dict)
+
+
+handler = logging.StreamHandler()
+handler.setFormatter(JsonFormatter())
+
+logger = logging.getLogger()
+log_level = os.getenv("LOG_LEVEL", logging.INFO)
+logger.setLevel(log_level)
+logger.addHandler(handler)
+
+lib_log_level = os.getenv("LIB_LOG_LEVEL", logging.INFO)
+logging.getLogger(name="httpcore.connection").setLevel(lib_log_level)
+logging.getLogger(name="httpcore.http11").setLevel(lib_log_level)
+logging.getLogger(name="httpx").setLevel(lib_log_level)
+logging.getLogger(name="kr8s._api").setLevel(lib_log_level)
+logging.getLogger(name="kr8s._auth").setLevel(lib_log_level)
+
+import os
+
+import uvloop
+
+import kr8s.asyncio
+
+from koreo.constants import API_GROUP, DEFAULT_API_VERSION
+from koreo.resource_function.prepare import prepare_resource_function
+from koreo.resource_function.structure import ResourceFunction
+from koreo.resource_template.prepare import prepare_resource_template
+from koreo.resource_template.structure import ResourceTemplate
+from koreo.value_function.prepare import prepare_value_function
+from koreo.value_function.structure import ValueFunction
+from koreo.workflow.structure import Workflow
+
+from controller import koreo_cache
+from controller import load_schemas
+from controller.workflow_prepare_shim import get_workflow_preparer
+from controller.custom_workflow import workflow_controller_system
+
+RECONNECT_TIMEOUT = 900
+
+API_VERSION = f"{API_GROUP}/{DEFAULT_API_VERSION}"
+
+HOT_LOADING = True
+
+KOREO_NAMESPACE = os.environ.get("KOREO_NAMESPACE", "koreo-testing")
+
+TEMPLATE_NAMESPACE = os.environ.get("TEMPLATE_NAMESPACE", "koreo-testing")
+
+RESOURCE_NAMESPACE = os.environ.get("RESOURCE_NAMESPACE", "koreo-testing")
+
+# NOTE: These are ordered so that each group's dependencies will already be
+# loaded when initially loaded into cache.
+KOREO_RESOURCES = [
+    (
+        TEMPLATE_NAMESPACE,
+        "ResourceTemplate",
+        ResourceTemplate,
+        prepare_resource_template,
+    ),
+    (KOREO_NAMESPACE, "ValueFunction", ValueFunction, prepare_value_function),
+    (KOREO_NAMESPACE, "ResourceFunction", ResourceFunction, prepare_resource_function),
+    # NOTE: Workflow is appended within `main` to integrate updates queue.
+]
+
+
+async def _koreo_resource_cache_manager(
+    api: kr8s.asyncio.Api,
+    namespace: str,
+    kind_title: str,
+    resource_class: type,
+    preparer,
+):
+    # Block until completion.
+    await koreo_cache.load_cache(
+        api=api,
+        namespace=namespace,
+        api_version=API_VERSION,
+        plural_kind=f"{kind_title.lower()}s",
+        kind_title=kind_title,
+        resource_class=resource_class,
+        preparer=preparer,
+    )
+
+    if not HOT_LOADING:
+        return
+
+    # Spawns long-term (infinite) cache maintainer in background
+    await koreo_cache.maintain_cache(
+        api=api,
+        namespace=namespace,
+        api_version=API_VERSION,
+        plural_kind=f"{kind_title.lower()}s",
+        kind_title=kind_title,
+        resource_class=resource_class,
+        preparer=preparer,
+        reconnect_timeout=RECONNECT_TIMEOUT,
+    )
+
+
+async def main():
+    api = await kr8s.asyncio.api()
+    api.timeout = RECONNECT_TIMEOUT
+
+    # The schemas must be loaded before Koreo resources can be prepared.
+    await load_schemas.load_koreo_resource_schemas(api)
+
+    # This is so the resources can be re-reconciled if their Workflows are
+    # updated.
+    prepare_workflow, workflow_updates_queue = get_workflow_preparer()
+
+    KOREO_RESOURCES.append(
+        (KOREO_NAMESPACE, "Workflow", Workflow, prepare_workflow),
+    )
+
+    async with asyncio.TaskGroup() as main_tg:
+        for namespace, kind_title, resource_class, preparer in KOREO_RESOURCES:
+            cache_task = main_tg.create_task(
+                _koreo_resource_cache_manager(
+                    api=api,
+                    namespace=namespace,
+                    kind_title=kind_title,
+                    resource_class=resource_class,
+                    preparer=preparer,
+                ),
+                name=f"cache-maintainer-{kind_title.lower()}",
+            )
+
+        # This is the schedule watcher / dispatcher for workflow crdRefs.
+        orchestrator_task = asyncio.create_task(
+            workflow_controller_system(
+                api=api,
+                namespace=RESOURCE_NAMESPACE,
+                workflow_updates_queue=workflow_updates_queue,
+            )
+        )
+
+
+if __name__ == "__main__":
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    try:
+        uvloop.run(main())
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        exit(0)
+

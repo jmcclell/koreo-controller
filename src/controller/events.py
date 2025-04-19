@@ -136,6 +136,7 @@ async def _cancel_watch(
     watched = workflow_watches.pop(workflow, None)
     if not watched:
         # This workflow has no active watches.
+        logger.debug(f"Workflow {workflow} has no active watches to cancel.")
         return
 
     watchers = resource_watchers.get(watched)
@@ -150,6 +151,7 @@ async def _cancel_watch(
     watchstander = watchstanders.get(watched)
     if not watchstander:
         # No watchstander
+        logger.debug(f"No watchstander for {watched} to cancel.")
         return
 
     _, queue = watchstander
@@ -160,6 +162,7 @@ async def _cancel_watch(
         return
 
     # No further need for this watch.
+    logger.debug(f"Stopping watch for {watched} as no watchers remain.")
     await queue.put(StopTheWatch())
     queue.shutdown()
 

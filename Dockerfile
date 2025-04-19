@@ -3,6 +3,7 @@ RUN apt-get update && apt-get -y install git
 RUN pip install --upgrade pip setuptools wheel
 RUN pip install pdm
 
+COPY koreo-core  /app/koreo-core
 COPY pyproject.toml pdm.lock README.md /app/
 
 WORKDIR /app

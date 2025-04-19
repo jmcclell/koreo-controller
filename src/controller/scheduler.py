@@ -26,8 +26,8 @@ class Configuration[T](NamedTuple):
 
     concurrency: int = 5
 
-    frequency_seconds: int = 1200
-    timeout_seconds: int = 30
+    frequency_seconds: int = 10
+    timeout_seconds: int = 8
 
     retry_max_retries: int = 10
     retry_delay_base: int = 10

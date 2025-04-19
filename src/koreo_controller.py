@@ -24,7 +24,7 @@ log_level = os.getenv("LOG_LEVEL", logging.INFO)
 logger.setLevel(log_level)
 logger.addHandler(handler)
 
-lib_log_level = os.getenv("LIB_LOG_LEVEL", logging.WARNING)
+lib_log_level = os.getenv("LIB_LOG_LEVEL", logging.INFO)
 logging.getLogger(name="httpcore.connection").setLevel(lib_log_level)
 logging.getLogger(name="httpcore.http11").setLevel(lib_log_level)
 logging.getLogger(name="httpx").setLevel(lib_log_level)

@@ -1,0 +1,14 @@
+{
+  "packages": [
+    "pdm@latest",
+    "python@3.13"
+  ],
+  "services": {},
+  "shell": {
+    "init_hook": [
+      "pdm install",
+      "eval $(pdm venv activate)"
+    ]
+  }
+}
+

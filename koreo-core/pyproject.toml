@@ -1,23 +1,26 @@
 [project]
-name = "koreo-controller"
-version = "0.1.11"
-description = "Koreo Controller runs Koreo Core as a Kubernetes Controller."
+name = "koreo-core"
+version = "0.1.8"
+description = "Type-safe and testable KRM Templates and Workflows."
 authors = [
-    {name = "Eric Larssen", email = "eric.larssen@realkinetic.com"},
     {name = "Robert Kluin", email = "robert.kluin@realkinetic.com"},
+    {name = "Eric Larssen", email = "eric.larssen@realkinetic.com"},
+    {name = "Tyler Treat", email = "tyler-treat@realkinetic.com"},
 ]
+
 dependencies = [
-    "koreo-core @ file:///${PROJECT_ROOT}/koreo-core",
     "cel-python==0.2.0",
+    "PyYAML==6.0.2",
     "kr8s==0.20.6",
-    "uvloop==0.21.0",
+    "fastjsonschema==2.21.1",
 ]
-requires-python = "==3.13.*"
+
+requires-python = ">=3.13"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 
-[tool.pdm]
-distribution = false
+[project.urls]
+Homepage = "https://koreo.dev"
 
 [dependency-groups]
 test = [
@@ -29,6 +32,13 @@ tooling = [
     "pyright==1.1.397",
 ]
 all = ["koreo-core[test,tooling]"]
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[tool.pdm]
+distribution = true
 
 [tool.pytest.ini_options]
 pythonpath = "src"
