@@ -2,8 +2,10 @@
 set -euo pipefail
 set -x
 
-rsync -a --exclude '.git' --exclude '.devbox' --exclude '.envrc' --exclude 'devbox.json' --exclude '.venv' ../koreo-core/ ./koreo-core
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-docker build -t koreo-controller:local .
+rsync -a --exclude '.git' --exclude '.devbox' --exclude '.envrc' --exclude 'devbox.json' --exclude '.venv' "${SCRIPT_DIR}/../koreo-core/" "${SCRIPT_DIR}/koreo-core"
+
+docker build -t koreo-controller:local "${SCRIPT_DIR}"
 kind load docker-image koreo-controller:local --name deployments-demo
 kubectl delete pods -l app.kubernetes.io/instance=koreo-controller

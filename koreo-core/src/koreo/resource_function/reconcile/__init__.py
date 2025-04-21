@@ -300,7 +300,7 @@ async def reconcile_krm_resource(
         actual=api_resource.raw,
         last_applied_value=last_applied,
     )
-    if rescurce_match.match and owner_reffed:
+    if resource_match.match and owner_reffed:
         logger.debug(f"{full_resource_name} matched spec, no update required.")
 
         return ReconcileResult(result=api_resource.raw, resource_id=resource_id)
@@ -670,18 +670,17 @@ async def _create_api_resource(
 
 def _forced_overlay(resource_api: type[APIObject], name: str, namespace: str | None):
     # Only include namespace when the resource API is namespaced
-    logger.debug(f"!!!!! namespace is `{namespace}`")
     metadata: dict[str, object] = {"name": name}
     if namespace is not None:
         metadata["namespace"] = namespace
 
-    data: dict[str, object] = {
-        "apiVersion": resource_api.version,
-        "kind": resource_api.kind,
-        "metadata": metadata
-    }
-
-    forced_overlay = celpy.json_to_cel(data)
+    forced_overlay = celpy.json_to_cel(
+        {
+            "apiVersion": resource_api.version,
+            "kind": resource_api.kind,
+            "metadata": metadata
+        }
+   )
 
     # Perhaps this could occur with some corrupt name config?
     if not isinstance(forced_overlay, celtypes.MapType):
